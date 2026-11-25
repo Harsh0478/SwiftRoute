@@ -1,0 +1,93 @@
+{
+  "info": {
+    "name": "SwiftRoute Logistics API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5000/api"
+    },
+    {
+      "key": "token",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "Auth - Register Customer",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/auth/register",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\": \"Harsh\", \"email\": \"harsh@swiftroute.in\", \"phone\": \"+919876543210\", \"password\": \"Password123\"}"
+        }
+      }
+    },
+    {
+      "name": "Auth - Login Customer",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{baseUrl}}/auth/login",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\": \"harsh@swiftroute.in\", \"password\": \"Password123\"}"
+        }
+      }
+    },
+    {
+      "name": "Shipments - Create Booking",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": "{{baseUrl}}/shipments",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"sender\": {\"name\": \"Harsh\", \"phone\": \"+919876543210\"}, \"receiver\": {\"name\": \"Aarav\", \"phone\": \"+919123456780\"}, \"packageDetails\": {\"name\": \"MacBook Pro 14\", \"weightKg\": 2.2, \"isFragile\": true}, \"pickupLocation\": {\"coordinates\": [77.321, 19.1383], \"formattedAddress\": \"Sector 14, Nanded\", \"city\": \"Nanded\", \"postalCode\": \"431601\"}, \"deliveryLocation\": {\"coordinates\": [73.8567, 18.5204], \"formattedAddress\": \"Koregaon Park, Pune\", \"city\": \"Pune\", \"postalCode\": \"411001\"}, \"deliveryType\": \"express\", \"paymentMethod\": \"online\"}"
+        }
+      }
+    },
+    {
+      "name": "Shipments - Track by Tracking ID",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/shipments/track/SR12345678"
+      }
+    },
+    {
+      "name": "Admin - Dashboard Analytics",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}"
+          }
+        ],
+        "url": "{{baseUrl}}/admin/dashboard"
+      }
+    }
+  ]
+}
