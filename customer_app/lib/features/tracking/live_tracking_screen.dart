@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart' as geo;
 import 'package:go_router/go_router.dart';
@@ -41,6 +42,9 @@ class _LiveTrackingScreenState extends ConsumerState<LiveTrackingScreen> {
     if (widget.initialShipment != null) {
       _applyShipmentData(widget.initialShipment!);
       _bindSocket(widget.initialShipment!['_id']);
+      if (widget.initialShipment!['deliveryOtp'] == null) {
+        _loadShipment();
+      }
     } else {
       _loadShipment();
     }
@@ -206,6 +210,8 @@ class _LiveTrackingScreenState extends ConsumerState<LiveTrackingScreen> {
   Widget build(BuildContext context) {
     if (_shipment == null) return const Scaffold(body: Center(child: CircularProgressIndicator()));
     final agent = _shipment!['deliveryAgentId'] as Map<String, dynamic>?;
+    final deliveryOtp = _shipment!['deliveryOtp']?.toString();
+    final showOtp = deliveryOtp != null && deliveryOtp.isNotEmpty && _status != 'Cancelled';
 
     return Scaffold(
       body: Stack(
@@ -249,11 +255,11 @@ class _LiveTrackingScreenState extends ConsumerState<LiveTrackingScreen> {
             ),
           ),
           DraggableScrollableSheet(
-            initialChildSize: 0.50,
+            initialChildSize: 0.54,
             minChildSize: 0.20,
-            maxChildSize: 0.72,
+            maxChildSize: 0.78,
             snap: true,
-            snapSizes: const [0.20, 0.50, 0.72],
+            snapSizes: const [0.20, 0.54, 0.78],
             builder: (context, scrollController) {
               return Container(
                 decoration: const BoxDecoration(
@@ -294,6 +300,88 @@ class _LiveTrackingScreenState extends ConsumerState<LiveTrackingScreen> {
                           ),
                         ],
                       ),
+                      if (showOtp) ...[
+                        const SizedBox(height: 14),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          decoration: BoxDecoration(
+                            color: AppColors.darkSurfaceElevated,
+                            borderRadius: BorderRadius.circular(18),
+                            border: Border.all(
+                              color: (_status == 'Delivered' ? AppColors.success : AppColors.primaryOrange).withValues(alpha: 0.45),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(
+                                  color: (_status == 'Delivered' ? AppColors.success : AppColors.primaryOrange).withValues(alpha: 0.16),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Icon(
+                                  _status == 'Delivered' ? Icons.verified_rounded : Icons.lock_outline_rounded,
+                                  color: _status == 'Delivered' ? AppColors.success : AppColors.primaryOrange,
+                                  size: 20,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _status == 'Delivered' ? 'Delivery Verified' : 'Delivery OTP',
+                                      style: const TextStyle(color: AppColors.white, fontWeight: FontWeight.w600, fontSize: 13),
+                                    ),
+                                    Text(
+                                      _status == 'Delivered'
+                                          ? 'Verified upon handover'
+                                          : 'Share this 4-digit PIN with your courier at drop-off',
+                                      style: const TextStyle(color: AppColors.secondaryText, fontSize: 11),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              GestureDetector(
+                                onTap: () {
+                                  Clipboard.setData(ClipboardData(text: deliveryOtp));
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text('Delivery OTP $deliveryOtp copied'),
+                                      duration: const Duration(seconds: 2),
+                                    ),
+                                  );
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: _status == 'Delivered' ? AppColors.success : AppColors.primaryOrange,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        deliveryOtp,
+                                        style: const TextStyle(
+                                          color: AppColors.white,
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 16,
+                                          letterSpacing: 3,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 4),
+                                      const Icon(Icons.copy_rounded, color: AppColors.white, size: 14),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 18),
                       Row(
                         children: List.generate(4, (i) {

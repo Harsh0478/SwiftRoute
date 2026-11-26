@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../core/network/dio_client.dart';
@@ -133,6 +134,12 @@ class _OrderHistoryScreenState extends ConsumerState<OrderHistoryScreen> {
                               itemBuilder: (context, index) {
                                 final order = _orders[index];
                                 final drop = order['deliveryLocation'] ?? {};
+                                final status = order['shipmentStatus'] ?? 'Assigning Courier...';
+                                final deliveryOtp = order['deliveryOtp']?.toString();
+                                final showOtp = deliveryOtp != null &&
+                                    deliveryOtp.isNotEmpty &&
+                                    status != 'Delivered' &&
+                                    status != 'Cancelled';
                                 return Container(
                                   margin: const EdgeInsets.only(bottom: 14),
                                   padding: const EdgeInsets.all(16),
@@ -156,13 +163,63 @@ class _OrderHistoryScreenState extends ConsumerState<OrderHistoryScreen> {
                                         Text('₹${order['shippingCost']}', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
                                       ]),
                                       const SizedBox(height: 14),
-                                      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                          decoration: BoxDecoration(border: Border.all(color: AppColors.primaryOrange.withValues(alpha: 0.4)), borderRadius: BorderRadius.circular(12)),
-                                          child: Text(order['shipmentStatus'] ?? 'Assigning Courier...',
-                                              style: const TextStyle(color: AppColors.primaryOrange, fontSize: 11, fontWeight: FontWeight.w600)),
+                                      Row(children: [
+                                        Expanded(
+                                          child: Wrap(
+                                            spacing: 8,
+                                            runSpacing: 6,
+                                            crossAxisAlignment: WrapCrossAlignment.center,
+                                            children: [
+                                              Container(
+                                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                                decoration: BoxDecoration(
+                                                  border: Border.all(color: AppColors.primaryOrange.withValues(alpha: 0.4)),
+                                                  borderRadius: BorderRadius.circular(12),
+                                                ),
+                                                child: Text(
+                                                  status,
+                                                  style: const TextStyle(color: AppColors.primaryOrange, fontSize: 11, fontWeight: FontWeight.w600),
+                                                ),
+                                              ),
+                                              if (showOtp)
+                                                GestureDetector(
+                                                  onTap: () {
+                                                    Clipboard.setData(ClipboardData(text: deliveryOtp));
+                                                    ScaffoldMessenger.of(context).showSnackBar(
+                                                      SnackBar(
+                                                        content: Text('Delivery OTP $deliveryOtp copied'),
+                                                        duration: const Duration(seconds: 2),
+                                                      ),
+                                                    );
+                                                  },
+                                                  child: Container(
+                                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                                    decoration: BoxDecoration(
+                                                      color: AppColors.darkSurface,
+                                                      borderRadius: BorderRadius.circular(12),
+                                                    ),
+                                                    child: Row(
+                                                      mainAxisSize: MainAxisSize.min,
+                                                      children: [
+                                                        const Icon(Icons.lock_outline_rounded, color: AppColors.primaryOrange, size: 12),
+                                                        const SizedBox(width: 4),
+                                                        Text(
+                                                          'OTP: $deliveryOtp',
+                                                          style: const TextStyle(
+                                                            color: AppColors.white,
+                                                            fontSize: 11,
+                                                            fontWeight: FontWeight.w700,
+                                                            letterSpacing: 1,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
                                         ),
+                                        const SizedBox(width: 8),
                                         GestureDetector(
                                           onTap: () => context.push('/track/${order['trackingId']}', extra: order),
                                           child: Container(

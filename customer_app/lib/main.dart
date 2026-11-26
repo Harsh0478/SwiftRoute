@@ -7,6 +7,10 @@ import 'core/theme/app_theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  assert(
+    ApiConstants.mapboxPublicToken.isNotEmpty,
+    'MAPBOX_ACCESS_TOKEN is empty. Run with --dart-define-from-file=.env',
+  );
   MapboxOptions.setAccessToken(ApiConstants.mapboxPublicToken);
   runApp(const ProviderScope(child: SwiftRouteCustomerApp()));
 }

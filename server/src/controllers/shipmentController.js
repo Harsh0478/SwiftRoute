@@ -157,6 +157,7 @@ exports.getCustomerShipments = async (req, res, next) => {
     const skip = (Number(page) - 1) * Number(limit);
     const [shipments, total] = await Promise.all([
       Shipment.find(query)
+        .select('+deliveryOtp')
         .populate('deliveryAgentId', 'name phone avatarUrl vehicleType vehicleNumber rating')
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -176,10 +177,12 @@ exports.getCustomerShipments = async (req, res, next) => {
 
 exports.trackByTrackingId = async (req, res, next) => {
   try {
-    const shipment = await Shipment.findOne({ trackingId: req.params.trackingId.toUpperCase() }).populate(
-      'deliveryAgentId',
-      'name phone avatarUrl vehicleType vehicleNumber rating currentLocation heading'
-    );
+    const shipment = await Shipment.findOne({ trackingId: req.params.trackingId.toUpperCase() })
+      .select('+deliveryOtp')
+      .populate(
+        'deliveryAgentId',
+        'name phone avatarUrl vehicleType vehicleNumber rating currentLocation heading'
+      );
     if (!shipment) return res.status(404).json({ success: false, message: 'Tracking ID not found' });
     res.json({ success: true, shipment });
   } catch (err) {
