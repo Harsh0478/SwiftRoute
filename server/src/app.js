@@ -56,6 +56,7 @@ app.delete('/api/users/addresses/:id', protect, async (req, res) => {
   res.json({ success: true, message: 'Address deleted' });
 });
 
+app.get('/api/shipments/nearby-agents', protect, shipmentController.checkNearbyAgents);
 app.post('/api/shipments', protect, upload.single('packageImage'), shipmentController.createShipment);
 app.get('/api/shipments', protect, shipmentController.getCustomerShipments);
 app.get('/api/shipments/track/:trackingId', shipmentController.trackByTrackingId);

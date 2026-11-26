@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart' as geo;
+import 'package:go_router/go_router.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:razorpay_flutter/razorpay_flutter.dart';
 import '../../core/network/dio_client.dart';
+import '../../core/providers/dev_mode_provider.dart';
 import '../../core/services/mapbox_geocoding_service.dart';
 import '../../core/theme/app_theme.dart';
 
@@ -17,17 +20,23 @@ class PackageBookingWizard extends ConsumerStatefulWidget {
 }
 
 class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
+  static const double _searchRadiusKm = 18.0;
+
   int _step = 0;
   late Razorpay _razorpay;
   Timer? _debounce;
+
+  final _step0FormKey = GlobalKey<FormState>();
+  final _step1FormKey = GlobalKey<FormState>();
+  final _step2FormKey = GlobalKey<FormState>();
 
   // Sender & Pickup state
   final _senderName = TextEditingController();
   final _senderPhone = TextEditingController();
   final _pickupSearchCtrl = TextEditingController();
   final _pickupAddr = TextEditingController();
-  final _pickupCity = TextEditingController(text: 'Nanded');
-  final _pickupPin = TextEditingController(text: '431601');
+  final _pickupCity = TextEditingController();
+  final _pickupPin = TextEditingController();
   double _pickupLat = 19.1383;
   double _pickupLng = 77.3210;
   List<MapboxPlace> _pickupSuggestions = [];
@@ -39,8 +48,8 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
   final _receiverPhone = TextEditingController();
   final _deliverySearchCtrl = TextEditingController();
   final _deliveryAddr = TextEditingController();
-  final _deliveryCity = TextEditingController(text: 'Pune');
-  final _deliveryPin = TextEditingController(text: '411001');
+  final _deliveryCity = TextEditingController();
+  final _deliveryPin = TextEditingController();
   double _deliveryLat = 18.5204;
   double _deliveryLng = 73.8567;
   List<MapboxPlace> _deliverySuggestions = [];
@@ -55,6 +64,12 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
   String _deliveryType = 'express';
   String _paymentMethod = 'online';
   bool _submitting = false;
+
+  // Nearby courier check (used when Development Mode is OFF)
+  bool _checkingNearbyAgents = false;
+  int? _nearbyAgentsCount;
+  String? _nearestAgentName;
+  double? _nearestAgentDistanceKm;
 
   @override
   void initState() {
@@ -139,6 +154,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
         _pickupPin.text = place.postalCode;
         _pickupSearchCtrl.text = place.name;
         _pickupSuggestions = [];
+        _nearbyAgentsCount = null;
       } else {
         _deliveryLat = place.latitude;
         _deliveryLng = place.longitude;
@@ -186,6 +202,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
       setState(() {
         _pickupLat = pos.latitude;
         _pickupLng = pos.longitude;
+        _nearbyAgentsCount = null;
         if (place != null) {
           _pickupAddr.text = place.fullAddress;
           _pickupCity.text = place.city;
@@ -223,6 +240,108 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
     }
   }
 
+  Future<void> _checkNearbyCouriers() async {
+    setState(() => _checkingNearbyAgents = true);
+    try {
+      final res = await ref.read(dioProvider).get(
+        '/shipments/nearby-agents',
+        queryParameters: {
+          'lat': _pickupLat,
+          'lng': _pickupLng,
+          'radiusKm': _searchRadiusKm,
+        },
+      );
+      if (!mounted) return;
+      final nearest = res.data['nearestAgent'] as Map<String, dynamic>?;
+      setState(() {
+        _nearbyAgentsCount = (res.data['count'] as num?)?.toInt() ?? 0;
+        _nearestAgentName = nearest?['name']?.toString();
+        _nearestAgentDistanceKm = (nearest?['distanceKm'] as num?)?.toDouble();
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _nearbyAgentsCount = 0;
+        _nearestAgentName = null;
+        _nearestAgentDistanceKm = null;
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _checkingNearbyAgents = false);
+      }
+    }
+  }
+
+  bool _validateCurrentStep() {
+    if (_step == 0) {
+      final valid = _step0FormKey.currentState?.validate() ?? false;
+      if (!valid) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Please fill in Sender Name, Phone, and Pickup Address before continuing.'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+      return valid;
+    }
+    if (_step == 1) {
+      final valid = _step1FormKey.currentState?.validate() ?? false;
+      if (!valid) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Please fill in Receiver Name, Phone, and Delivery Address before continuing.'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+      return valid;
+    }
+    if (_step == 2) {
+      final valid = _step2FormKey.currentState?.validate() ?? false;
+      if (!valid) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Please enter valid Package Name and Weight.'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
+      return valid;
+    }
+    return true;
+  }
+
+  void _handleContinue() {
+    if (!_validateCurrentStep()) return;
+
+    if (_step < 3) {
+      final nextStep = _step + 1;
+      setState(() {
+        _step = nextStep;
+        if (nextStep == 3) {
+          final routeEstimate = MapboxGeocodingService.estimateRoute(
+            startLat: _pickupLat,
+            startLng: _pickupLng,
+            endLat: _deliveryLat,
+            endLng: _deliveryLng,
+          );
+          if (_deliveryType == 'same_day' && routeEstimate.distanceKm > 60.0) {
+            _deliveryType = 'express';
+          }
+        }
+      });
+
+      if (nextStep == 3 && !ref.read(developmentModeProvider)) {
+        _checkNearbyCouriers();
+      }
+    } else {
+      _submitBooking();
+    }
+  }
+
   Future<void> _handlePaymentSuccess(PaymentSuccessResponse response) async {
     await ref.read(dioProvider).post('/payments/verify', data: {
       'razorpay_order_id': response.orderId,
@@ -249,7 +368,60 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
     );
   }
 
+  void _showNoCourierAvailableDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.location_searching_rounded,
+                color: AppColors.error, size: 24),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'No Delivery Boy Nearby',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+        content: const Text(
+          'No online delivery partner is available within 18 km of your pickup location right now.Please try again later.',
+          style: TextStyle(fontSize: 13.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _checkNearbyCouriers();
+            },
+            child: const Text('Retry Search'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              context.go('/profile');
+            },
+            child: const Text('Open Profile'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _submitBooking() async {
+    final isDevMode = ref.read(developmentModeProvider);
+
+    if (!isDevMode) {
+      await _checkNearbyCouriers();
+      if (!mounted) return;
+      if ((_nearbyAgentsCount ?? 0) <= 0) {
+        _showNoCourierAvailableDialog();
+        return;
+      }
+    }
+
     setState(() => _submitting = true);
     try {
       final routeEstimate = MapboxGeocodingService.estimateRoute(
@@ -258,62 +430,50 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
         endLat: _deliveryLat,
         endLng: _deliveryLng,
       );
+      final speedOptions = MapboxGeocodingService.calculateDeliverySpeedOptions(
+        distanceKm: routeEstimate.distanceKm,
+        weightKg: double.tryParse(_weightCtrl.text) ?? 1.0,
+        isFragile: _isFragile,
+      );
+      final selectedSpeed = speedOptions.firstWhere(
+        (opt) => opt.type == _deliveryType && opt.isAvailable,
+        orElse: () => speedOptions.firstWhere((opt) => opt.type == 'express'),
+      );
 
       final dio = ref.read(dioProvider);
       final res = await dio.post('/shipments', data: {
         'sender': {
-          'name': _senderName.text.trim().isEmpty
-              ? 'Customer'
-              : _senderName.text.trim(),
-          'phone': _senderPhone.text.trim().isEmpty
-              ? '+919876543210'
-              : _senderPhone.text.trim(),
+          'name': _senderName.text.trim(),
+          'phone': _senderPhone.text.trim(),
         },
         'receiver': {
-          'name': _receiverName.text.trim().isEmpty
-              ? 'Receiver'
-              : _receiverName.text.trim(),
-          'phone': _receiverPhone.text.trim().isEmpty
-              ? '+919876543211'
-              : _receiverPhone.text.trim(),
+          'name': _receiverName.text.trim(),
+          'phone': _receiverPhone.text.trim(),
         },
         'packageDetails': {
-          'name': _pkgName.text.trim().isEmpty
-              ? 'Standard Parcel'
-              : _pkgName.text.trim(),
+          'name': _pkgName.text.trim(),
           'category': _category,
           'weightKg': double.tryParse(_weightCtrl.text) ?? 1.0,
           'isFragile': _isFragile,
         },
         'pickupLocation': {
           'coordinates': [_pickupLng, _pickupLat],
-          'formattedAddress': _pickupAddr.text.trim().isEmpty
-              ? _pickupCity.text
-              : _pickupAddr.text.trim(),
-          'city': _pickupCity.text.trim().isEmpty
-              ? 'Origin'
-              : _pickupCity.text.trim(),
-          'postalCode': _pickupPin.text.trim().isEmpty
-              ? '431601'
-              : _pickupPin.text.trim(),
+          'formattedAddress': _pickupAddr.text.trim(),
+          'city': _pickupCity.text.trim(),
+          'postalCode': _pickupPin.text.trim(),
         },
         'deliveryLocation': {
           'coordinates': [_deliveryLng, _deliveryLat],
-          'formattedAddress': _deliveryAddr.text.trim().isEmpty
-              ? _deliveryCity.text
-              : _deliveryAddr.text.trim(),
-          'city': _deliveryCity.text.trim().isEmpty
-              ? 'Destination'
-              : _deliveryCity.text.trim(),
-          'postalCode': _deliveryPin.text.trim().isEmpty
-              ? '411001'
-              : _deliveryPin.text.trim(),
+          'formattedAddress': _deliveryAddr.text.trim(),
+          'city': _deliveryCity.text.trim(),
+          'postalCode': _deliveryPin.text.trim(),
         },
         'distanceKm': routeEstimate.distanceKm,
-        'durationMinutes': routeEstimate.durationMinutes,
-        'deliveryType': _deliveryType,
+        'durationMinutes': selectedSpeed.estimatedMinutes,
+        'deliveryType': selectedSpeed.type,
         'paymentMethod': _paymentMethod,
         'promoCode': _promoCtrl.text.trim(),
+        'developmentMode': isDevMode,
       });
 
       final shipment = res.data['shipment'];
@@ -328,7 +488,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
           'name': 'SwiftRoute Logistics',
           'order_id': orderRes.data['orderId'],
           'description': 'Shipment ${shipment['trackingId']}',
-          'prefill': {'contact': _senderPhone.text},
+          'prefill': {'contact': _senderPhone.text.trim()},
         });
       } else if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -338,6 +498,23 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
           ),
         );
         Navigator.of(context).pop();
+      }
+    } on DioException catch (e) {
+      if (!mounted) return;
+      final data = e.response?.data;
+      if (data is Map && data['code'] == 'NO_COURIER_NEARBY') {
+        setState(() => _nearbyAgentsCount = 0);
+        _showNoCourierAvailableDialog();
+      } else {
+        final msg = (data is Map && data['message'] != null)
+            ? data['message'].toString()
+            : 'Could not create booking. Check server connection.';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(msg),
+            backgroundColor: AppColors.error,
+          ),
+        );
       }
     } catch (_) {
       if (mounted) {
@@ -353,6 +530,42 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
         setState(() => _submitting = false);
       }
     }
+  }
+
+  String? _requiredTextValidator(String? value, String label,
+      {int minLength = 2}) {
+    final trimmed = value?.trim() ?? '';
+    if (trimmed.isEmpty) {
+      return '$label is required';
+    }
+    if (trimmed.length < minLength) {
+      return '$label must be at least $minLength characters';
+    }
+    return null;
+  }
+
+  String? _phoneValidator(String? value, String label) {
+    final trimmed = value?.trim() ?? '';
+    if (trimmed.isEmpty) {
+      return '$label is required';
+    }
+    final digitsOnly = trimmed.replaceAll(RegExp(r'\D'), '');
+    if (digitsOnly.length < 10) {
+      return 'Enter a valid 10-digit phone number';
+    }
+    return null;
+  }
+
+  String? _pinValidator(String? value) {
+    final trimmed = value?.trim() ?? '';
+    if (trimmed.isEmpty) {
+      return 'PIN required';
+    }
+    final digitsOnly = trimmed.replaceAll(RegExp(r'\D'), '');
+    if (digitsOnly.length < 4) {
+      return 'Invalid PIN';
+    }
+    return null;
   }
 
   Widget _buildLocationPickerSection({
@@ -512,32 +725,51 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
           ],
         ),
         const SizedBox(height: 12),
-        TextField(
+        TextFormField(
           controller: addrCtrl,
+          validator: (v) => _requiredTextValidator(
+            v,
+            isPickup ? 'Pickup street address' : 'Delivery street address',
+            minLength: 4,
+          ),
           decoration: InputDecoration(
+            labelText: isPickup
+                ? 'Full Pickup Street Address *'
+                : 'Full Delivery Street Address *',
             hintText: isPickup
-                ? 'Full Pickup Street Address'
-                : 'Full Delivery Street Address',
+                ? 'House/Flat, Street, Landmark'
+                : 'House/Flat, Street, Landmark',
           ),
         ),
         const SizedBox(height: 12),
         Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Expanded(
               flex: 2,
-              child: TextField(
+              child: TextFormField(
                 controller: cityCtrl,
+                validator: (v) => _requiredTextValidator(
+                  v,
+                  isPickup ? 'Pickup city' : 'Delivery city',
+                  minLength: 2,
+                ),
                 decoration: InputDecoration(
-                  hintText: isPickup ? 'Pickup City' : 'Delivery City',
+                  labelText: isPickup ? 'Pickup City *' : 'Delivery City *',
+                  hintText: isPickup ? 'e.g. Amravati' : 'e.g. Pune',
                 ),
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
-              child: TextField(
+              child: TextFormField(
                 controller: pinCtrl,
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(hintText: 'PIN Code'),
+                validator: _pinValidator,
+                decoration: const InputDecoration(
+                  labelText: 'PIN Code *',
+                  hintText: '444601',
+                ),
               ),
             ),
           ],
@@ -553,6 +785,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
 
   @override
   Widget build(BuildContext context) {
+    final isDevMode = ref.watch(developmentModeProvider);
     final stepTitles = [
       'Sender & Pickup',
       'Receiver & Drop',
@@ -564,6 +797,21 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
       startLng: _pickupLng,
       endLat: _deliveryLat,
       endLng: _deliveryLng,
+    );
+    final parsedWeight = double.tryParse(_weightCtrl.text) ?? 1.5;
+    final speedOptions = MapboxGeocodingService.calculateDeliverySpeedOptions(
+      distanceKm: routeEstimate.distanceKm,
+      weightKg: parsedWeight,
+      isFragile: _isFragile,
+    );
+    final effectiveDeliveryType = speedOptions.any(
+      (opt) => opt.type == _deliveryType && opt.isAvailable,
+    )
+        ? _deliveryType
+        : 'express';
+    final selectedSpeedOption = speedOptions.firstWhere(
+      (opt) => opt.type == effectiveDeliveryType,
+      orElse: () => speedOptions.firstWhere((opt) => opt.type == 'express'),
     );
 
     return Scaffold(
@@ -597,175 +845,253 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
               child: SingleChildScrollView(
                 child: Column(
                   children: [
-                    if (_step == 0) ...[
-                      TextField(
-                        controller: _senderName,
-                        decoration:
-                            const InputDecoration(hintText: 'Sender Full Name'),
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _senderPhone,
-                        keyboardType: TextInputType.phone,
-                        decoration:
-                            const InputDecoration(hintText: 'Sender Phone'),
-                      ),
-                      const SizedBox(height: 14),
-                      _buildLocationPickerSection(
-                        isPickup: true,
-                        searchCtrl: _pickupSearchCtrl,
-                        addrCtrl: _pickupAddr,
-                        cityCtrl: _pickupCity,
-                        pinCtrl: _pickupPin,
-                        suggestions: _pickupSuggestions,
-                        isSearching: _searchingPickup,
-                        lat: _pickupLat,
-                        lng: _pickupLng,
-                      ),
-                    ],
-                    if (_step == 1) ...[
-                      TextField(
-                        controller: _receiverName,
-                        decoration: const InputDecoration(
-                          hintText: 'Receiver Full Name',
+                    if (_step == 0)
+                      Form(
+                        key: _step0FormKey,
+                        child: Column(
+                          children: [
+                            TextFormField(
+                              controller: _senderName,
+                              textCapitalization: TextCapitalization.words,
+                              validator: (v) =>
+                                  _requiredTextValidator(v, 'Sender full name'),
+                              decoration: const InputDecoration(
+                                labelText: 'Sender Full Name *',
+                                hintText: 'Enter sender name',
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            TextFormField(
+                              controller: _senderPhone,
+                              keyboardType: TextInputType.phone,
+                              validator: (v) =>
+                                  _phoneValidator(v, 'Sender phone'),
+                              decoration: const InputDecoration(
+                                labelText: 'Sender Phone *',
+                                hintText: '+91 9876543210',
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            _buildLocationPickerSection(
+                              isPickup: true,
+                              searchCtrl: _pickupSearchCtrl,
+                              addrCtrl: _pickupAddr,
+                              cityCtrl: _pickupCity,
+                              pinCtrl: _pickupPin,
+                              suggestions: _pickupSuggestions,
+                              isSearching: _searchingPickup,
+                              lat: _pickupLat,
+                              lng: _pickupLng,
+                            ),
+                          ],
                         ),
                       ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _receiverPhone,
-                        keyboardType: TextInputType.phone,
-                        decoration:
-                            const InputDecoration(hintText: 'Receiver Phone'),
-                      ),
-                      const SizedBox(height: 14),
-                      _buildLocationPickerSection(
-                        isPickup: false,
-                        searchCtrl: _deliverySearchCtrl,
-                        addrCtrl: _deliveryAddr,
-                        cityCtrl: _deliveryCity,
-                        pinCtrl: _deliveryPin,
-                        suggestions: _deliverySuggestions,
-                        isSearching: _searchingDelivery,
-                        lat: _deliveryLat,
-                        lng: _deliveryLng,
-                      ),
-                    ],
-                    if (_step == 2) ...[
-                      TextField(
-                        controller: _pkgName,
-                        decoration: const InputDecoration(
-                          hintText: 'Package Name (e.g. Laptop)',
+                    if (_step == 1)
+                      Form(
+                        key: _step1FormKey,
+                        child: Column(
+                          children: [
+                            TextFormField(
+                              controller: _receiverName,
+                              textCapitalization: TextCapitalization.words,
+                              validator: (v) => _requiredTextValidator(
+                                  v, 'Receiver full name'),
+                              decoration: const InputDecoration(
+                                labelText: 'Receiver Full Name *',
+                                hintText: 'Enter receiver name',
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            TextFormField(
+                              controller: _receiverPhone,
+                              keyboardType: TextInputType.phone,
+                              validator: (v) =>
+                                  _phoneValidator(v, 'Receiver phone'),
+                              decoration: const InputDecoration(
+                                labelText: 'Receiver Phone *',
+                                hintText: '+91 9876543211',
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            _buildLocationPickerSection(
+                              isPickup: false,
+                              searchCtrl: _deliverySearchCtrl,
+                              addrCtrl: _deliveryAddr,
+                              cityCtrl: _deliveryCity,
+                              pinCtrl: _deliveryPin,
+                              suggestions: _deliverySuggestions,
+                              isSearching: _searchingDelivery,
+                              lat: _deliveryLat,
+                              lng: _deliveryLng,
+                            ),
+                          ],
                         ),
                       ),
-                      const SizedBox(height: 12),
-                      DropdownButtonFormField<String>(
-                        initialValue: _category,
-                        decoration: const InputDecoration(labelText: 'Category'),
-                        items: const [
-                          DropdownMenuItem(
-                            value: 'Electronics',
-                            child: Text('Electronics'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'Documents',
-                            child: Text('Documents'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'Apparel',
-                            child: Text('Apparel'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'Fragile',
-                            child: Text('Fragile'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'Food & Perishables',
-                            child: Text('Food & Perishables'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'Other',
-                            child: Text('Other'),
-                          ),
-                        ],
-                        onChanged: (v) {
-                          if (v != null) {
-                            setState(() => _category = v);
-                          }
-                        },
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _weightCtrl,
-                        keyboardType: TextInputType.number,
-                        decoration:
-                            const InputDecoration(hintText: 'Weight (Kg)'),
-                      ),
-                      const SizedBox(height: 12),
-                      Container(
-                        decoration: BoxDecoration(
-                          color: AppColors.white,
-                          borderRadius: BorderRadius.circular(16),
+                    if (_step == 2)
+                      Form(
+                        key: _step2FormKey,
+                        child: Column(
+                          children: [
+                            TextFormField(
+                              controller: _pkgName,
+                              validator: (v) =>
+                                  _requiredTextValidator(v, 'Package name'),
+                              decoration: const InputDecoration(
+                                labelText: 'Package Name *',
+                                hintText: 'e.g. Laptop, Documents',
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            DropdownButtonFormField<String>(
+                              initialValue: _category,
+                              decoration:
+                                  const InputDecoration(labelText: 'Category'),
+                              items: const [
+                                DropdownMenuItem(
+                                  value: 'Electronics',
+                                  child: Text('Electronics'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'Documents',
+                                  child: Text('Documents'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'Apparel',
+                                  child: Text('Apparel'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'Fragile',
+                                  child: Text('Fragile'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'Food & Perishables',
+                                  child: Text('Food & Perishables'),
+                                ),
+                                DropdownMenuItem(
+                                  value: 'Other',
+                                  child: Text('Other'),
+                                ),
+                              ],
+                              onChanged: (v) {
+                                if (v != null) {
+                                  setState(() => _category = v);
+                                }
+                              },
+                            ),
+                            const SizedBox(height: 12),
+                            TextFormField(
+                              controller: _weightCtrl,
+                              keyboardType:
+                                  const TextInputType.numberWithOptions(
+                                      decimal: true),
+                              validator: (v) {
+                                final w = double.tryParse(v?.trim() ?? '');
+                                if (w == null || w <= 0) {
+                                  return 'Enter a valid weight in Kg';
+                                }
+                                return null;
+                              },
+                              decoration: const InputDecoration(
+                                labelText: 'Weight (Kg) *',
+                                hintText: '1.5',
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Container(
+                              decoration: BoxDecoration(
+                                color: AppColors.white,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Material(
+                                type: MaterialType.transparency,
+                                child: SwitchListTile(
+                                  title: const Text('Fragile Handling (+₹35)'),
+                                  activeThumbColor: AppColors.primaryOrange,
+                                  value: _isFragile,
+                                  onChanged: (v) =>
+                                      setState(() => _isFragile = v),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                        child: Material(
-                          type: MaterialType.transparency,
-                          child: SwitchListTile(
-                            title: const Text('Fragile Handling (+₹35)'),
-                            activeThumbColor: AppColors.primaryOrange,
-                            value: _isFragile,
-                            onChanged: (v) => setState(() => _isFragile = v),
-                          ),
-                        ),
                       ),
-                    ],
                     if (_step == 3) ...[
                       Container(
                         padding: const EdgeInsets.all(16),
-                        margin: const EdgeInsets.only(bottom: 16),
+                        margin: const EdgeInsets.only(bottom: 14),
                         decoration: BoxDecoration(
                           color: AppColors.secondaryCream,
                           borderRadius: BorderRadius.circular(18),
                         ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        child: Column(
                           children: [
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  const Text(
-                                    'Route Summary',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: AppColors.secondaryText,
-                                    ),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        'Route Summary',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color: AppColors.secondaryText,
+                                        ),
+                                      ),
+                                      Text(
+                                        '${_pickupCity.text.trim()} → ${_deliveryCity.text.trim()}',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w700,
+                                          fontSize: 15,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ],
                                   ),
-                                  Text(
-                                    '${_pickupCity.text} → ${_deliveryCity.text}',
-                                    style: const TextStyle(
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 15,
+                                ),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Text(
+                                      '${routeEstimate.distanceKm} km',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                        color: AppColors.primaryOrange,
+                                        fontSize: 15,
+                                      ),
                                     ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ],
-                              ),
+                                    Text(
+                                      'Est. ${selectedSpeedOption.etaLabel}',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppColors.secondaryText,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
                             ),
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.end,
+                            const Divider(height: 18, color: Colors.black12),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
                                 Text(
-                                  '${routeEstimate.distanceKm} km',
+                                  'Speed: ~${selectedSpeedOption.averageSpeedKmh.round()} km/h avg',
                                   style: const TextStyle(
-                                    fontWeight: FontWeight.w700,
-                                    color: AppColors.primaryOrange,
-                                    fontSize: 15,
+                                    fontSize: 12,
+                                    color: AppColors.secondaryText,
                                   ),
                                 ),
                                 Text(
-                                  '~${routeEstimate.durationMinutes} mins',
+                                  'Total: ₹${selectedSpeedOption.estimatedTotalInr} (incl. GST)',
                                   style: const TextStyle(
-                                    fontSize: 11,
-                                    color: AppColors.secondaryText,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 13,
+                                    color: AppColors.primaryText,
                                   ),
                                 ),
                               ],
@@ -773,24 +1099,98 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
                           ],
                         ),
                       ),
+                      if (!isDevMode)
+                        Container(
+                          padding: const EdgeInsets.all(14),
+                          margin: const EdgeInsets.only(bottom: 14),
+                          decoration: BoxDecoration(
+                            color: _checkingNearbyAgents
+                                ? AppColors.white
+                                : ((_nearbyAgentsCount ?? 0) > 0
+                                    ? AppColors.success.withValues(alpha: 0.12)
+                                    : AppColors.error.withValues(alpha: 0.12)),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: _checkingNearbyAgents
+                                  ? AppColors.secondaryCream
+                                  : ((_nearbyAgentsCount ?? 0) > 0
+                                      ? AppColors.success
+                                      : AppColors.error),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              if (_checkingNearbyAgents)
+                                const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child:
+                                      CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              else
+                                Icon(
+                                  (_nearbyAgentsCount ?? 0) > 0
+                                      ? Icons.check_circle_rounded
+                                      : Icons.error_outline_rounded,
+                                  color: (_nearbyAgentsCount ?? 0) > 0
+                                      ? AppColors.success
+                                      : AppColors.error,
+                                  size: 20,
+                                ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  _checkingNearbyAgents
+                                      ? 'Searching delivery partners within 18 km...'
+                                      : ((_nearbyAgentsCount ?? 0) > 0
+                                          ? '$_nearbyAgentsCount courier(s) nearby${_nearestAgentName != null ? ' • Nearest: $_nearestAgentName (${_nearestAgentDistanceKm?.toStringAsFixed(1)} km)' : ''}'
+                                          : 'No delivery boy available within 18 km of pickup.'),
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: _checkingNearbyAgents
+                                        ? AppColors.primaryText
+                                        : ((_nearbyAgentsCount ?? 0) > 0
+                                            ? AppColors.success
+                                            : AppColors.error),
+                                  ),
+                                ),
+                              ),
+                              if (!_checkingNearbyAgents)
+                                IconButton(
+                                  icon: const Icon(Icons.refresh_rounded,
+                                      size: 18),
+                                  tooltip: 'Re-check 18 km radius',
+                                  onPressed: _checkNearbyCouriers,
+                                ),
+                            ],
+                          ),
+                        ),
                       DropdownButtonFormField<String>(
-                        initialValue: _deliveryType,
-                        decoration:
-                            const InputDecoration(labelText: 'Delivery Speed'),
-                        items: const [
-                          DropdownMenuItem(
-                            value: 'standard',
-                            child: Text('Standard Delivery (48 hrs)'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'express',
-                            child: Text('Express Delivery (24 hrs)'),
-                          ),
-                          DropdownMenuItem(
-                            value: 'same_day',
-                            child: Text('Same-Day Priority (4 hrs)'),
-                          ),
-                        ],
+                        key: ValueKey(
+                            'speed_${routeEstimate.distanceKm}_$effectiveDeliveryType'),
+                        initialValue: effectiveDeliveryType,
+                        decoration: const InputDecoration(
+                            labelText: 'Delivery Speed (Distance-Based)'),
+                        items: speedOptions
+                            .map(
+                              (opt) => DropdownMenuItem<String>(
+                                value: opt.type,
+                                enabled: opt.isAvailable,
+                                child: Text(
+                                  opt.isAvailable
+                                      ? '${opt.title} (${opt.etaLabel}) • ₹${opt.estimatedTotalInr}'
+                                      : '${opt.title} (${opt.etaLabel})',
+                                  style: TextStyle(
+                                    color: opt.isAvailable
+                                        ? AppColors.primaryText
+                                        : AppColors.secondaryText,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ),
+                            )
+                            .toList(),
                         onChanged: (v) {
                           if (v != null) {
                             setState(() => _deliveryType = v);
@@ -849,15 +1249,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
                 Expanded(
                   flex: 2,
                   child: ElevatedButton(
-                    onPressed: _submitting
-                        ? null
-                        : () {
-                            if (_step < 3) {
-                              setState(() => _step++);
-                            } else {
-                              _submitBooking();
-                            }
-                          },
+                    onPressed: _submitting ? null : _handleContinue,
                     child: Text(
                       _step < 3
                           ? 'Continue'
@@ -927,8 +1319,8 @@ class _MapboxPinDropScreenState extends ConsumerState<_MapboxPinDropScreen> {
           MapboxPlace(
             name: 'Pinned Location',
             fullAddress: '${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}',
-            city: 'Nanded',
-            postalCode: '431601',
+            city: 'Amravati',
+            postalCode: '444601',
             latitude: lat,
             longitude: lng,
           );

@@ -6,6 +6,111 @@ const calculateDeliveryPrice = require('../utils/calculateDeliveryPrice');
 const { uploadBufferToCloudinary } = require('../config/cloudinary');
 const { sendPushNotification } = require('../services/notificationService');
 
+const NEARBY_COURIER_RADIUS_KM = 18;
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function calculateEstimatedDurationMinutes(distanceKm, deliveryType) {
+  const safeDistance = Math.max(Number(distanceKm) || 2, 2);
+  if (deliveryType === 'same_day') {
+    return Math.max(45, Math.round((safeDistance / 38) * 60 + 40));
+  }
+  if (deliveryType === 'express') {
+    const speed = safeDistance <= 30 ? 30 : 48;
+    const buffer = safeDistance <= 30 ? 60 : 180;
+    return Math.max(90, Math.round((safeDistance / speed) * 60 + buffer));
+  }
+  const speed = safeDistance <= 30 ? 22 : 32;
+  const buffer = safeDistance <= 30 ? 120 : 480;
+  return Math.max(150, Math.round((safeDistance / speed) * 60 + buffer));
+}
+
+async function findNearbyAgents(pickupCoords, radiusKm = NEARBY_COURIER_RADIUS_KM) {
+  const [pickupLng, pickupLat] = pickupCoords;
+  const maxMeters = radiusKm * 1000;
+
+  try {
+    const agents = await DeliveryAgent.find({
+      isOnline: true,
+      isAvailable: true,
+      kycStatus: 'approved',
+      currentLocation: {
+        $near: {
+          $geometry: { type: 'Point', coordinates: [Number(pickupLng), Number(pickupLat)] },
+          $maxDistance: maxMeters,
+        },
+      },
+    }).limit(10);
+
+    return agents.map((agent) => {
+      const [aLng, aLat] = agent.currentLocation?.coordinates || [0, 0];
+      return {
+        agent,
+        distanceKm: Number(haversineKm(Number(pickupLat), Number(pickupLng), aLat, aLng).toFixed(2)),
+      };
+    });
+  } catch (_) {
+    // Fallback Haversine filter if 2dsphere index is still building
+    const onlineAgents = await DeliveryAgent.find({
+      isOnline: true,
+      isAvailable: true,
+      kycStatus: 'approved',
+    });
+
+    return onlineAgents
+      .map((agent) => {
+        const [aLng, aLat] = agent.currentLocation?.coordinates || [0, 0];
+        if (aLat === 0 && aLng === 0) return null;
+        const dist = haversineKm(Number(pickupLat), Number(pickupLng), aLat, aLng);
+        return dist <= radiusKm ? { agent, distanceKm: Number(dist.toFixed(2)) } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+  }
+}
+
+exports.checkNearbyAgents = async (req, res, next) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    const requestedRadius = Number(req.query.radiusKm) || NEARBY_COURIER_RADIUS_KM;
+    const radiusKm = Math.min(Math.max(requestedRadius, 15), 20);
+
+    if (Number.isNaN(lat) || Number.isNaN(lng)) {
+      return res.status(400).json({ success: false, message: 'Valid lat and lng query parameters are required.' });
+    }
+
+    const nearby = await findNearbyAgents([lng, lat], radiusKm);
+    const nearest = nearby[0] || null;
+
+    res.json({
+      success: true,
+      available: nearby.length > 0,
+      count: nearby.length,
+      radiusKm,
+      nearestAgent: nearest
+        ? {
+            id: nearest.agent._id,
+            name: nearest.agent.name,
+            vehicleType: nearest.agent.vehicleType,
+            distanceKm: nearest.distanceKm,
+          }
+        : null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.createShipment = async (req, res, next) => {
   try {
     const payload = typeof req.body.data === 'string' ? JSON.parse(req.body.data) : req.body;
@@ -16,12 +121,50 @@ exports.createShipment = async (req, res, next) => {
       pickupLocation,
       deliveryLocation,
       distanceKm = 8.5,
-      durationMinutes = 35,
       deliveryType = 'standard',
       scheduledPickupAt,
       paymentMethod = 'online',
       promoCode = '',
+      developmentMode = true,
     } = payload;
+
+    const isDevMode = developmentMode === true || developmentMode === 'true';
+
+    if (!sender?.name?.trim() || !sender?.phone?.trim() || !pickupLocation?.formattedAddress?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Sender name, phone, and pickup address are required.',
+      });
+    }
+
+    if (!receiver?.name?.trim() || !receiver?.phone?.trim() || !deliveryLocation?.formattedAddress?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Receiver name, phone, and delivery address are required.',
+      });
+    }
+
+    // 1. Search for nearest online & available partner within 18 km (15-20 km radius)
+    const nearby = await findNearbyAgents(pickupLocation.coordinates, NEARBY_COURIER_RADIUS_KM);
+    let nearestAgent = nearby[0]?.agent || null;
+
+    if (!isDevMode && !nearestAgent) {
+      return res.status(400).json({
+        success: false,
+        code: 'NO_COURIER_NEARBY',
+        message:
+          'No delivery partner available within 18 km of pickup location. Enable Development Mode in Profile to send directly.',
+      });
+    }
+
+    // 2. In Development Mode, fall back to any online & available partner so testing auto-assigns
+    if (isDevMode && !nearestAgent) {
+      nearestAgent = await DeliveryAgent.findOne({
+        isOnline: true,
+        isAvailable: true,
+        kycStatus: 'approved',
+      }).sort({ updatedAt: -1 });
+    }
 
     let imageUrl = packageDetails.imageUrl || '';
     if (req.file) {
@@ -46,30 +189,8 @@ exports.createShipment = async (req, res, next) => {
       promotion,
     });
 
-    const hoursToAdd = deliveryType === 'same_day' ? 4 : deliveryType === 'express' ? 24 : 48;
-    const estimatedDelivery = new Date(Date.now() + hoursToAdd * 3600 * 1000);
-
-    // 1. Prefer nearest online & available partner within 25 km
-    let nearestAgent = await DeliveryAgent.findOne({
-      isOnline: true,
-      isAvailable: true,
-      kycStatus: 'approved',
-      currentLocation: {
-        $near: {
-          $geometry: { type: 'Point', coordinates: pickupLocation.coordinates },
-          $maxDistance: 25000,
-        },
-      },
-    });
-
-    // 2. Fallback: pick any online & available partner so emulator / cross-city tests auto-assign
-    if (!nearestAgent) {
-      nearestAgent = await DeliveryAgent.findOne({
-        isOnline: true,
-        isAvailable: true,
-        kycStatus: 'approved',
-      }).sort({ updatedAt: -1 });
-    }
+    const calculatedMinutes = calculateEstimatedDurationMinutes(distanceKm, deliveryType);
+    const estimatedDelivery = new Date(Date.now() + calculatedMinutes * 60 * 1000);
 
     const initialStatus = nearestAgent ? 'Order Confirmed' : 'Assigning Courier...';
 
@@ -83,7 +204,7 @@ exports.createShipment = async (req, res, next) => {
       pickupLocation,
       deliveryLocation,
       distanceKm,
-      durationMinutes,
+      durationMinutes: calculatedMinutes,
       deliveryType,
       scheduledPickupAt,
       pricing: { ...pricing, promoCode: promotion ? promotion.code : '' },
