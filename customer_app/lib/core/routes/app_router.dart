@@ -9,6 +9,8 @@ import '../../features/tracking/live_tracking_screen.dart';
 import '../../features/shipments/order_history_screen.dart';
 import '../../features/chat/shipment_chat_screen.dart';
 import '../../features/profile/profile_screen.dart';
+import '../../features/profile/profile_details_screen.dart';
+import '../../features/profile/help_support_screen.dart';
 
 final appRouter = GoRouter(
   initialLocation: '/splash',
@@ -21,6 +23,8 @@ final appRouter = GoRouter(
     GoRoute(path: '/booking', builder: (_, __) => const PackageBookingWizard()),
     GoRoute(path: '/orders', builder: (_, __) => const OrderHistoryScreen()),
     GoRoute(path: '/profile', builder: (_, __) => const ProfileScreen()),
+    GoRoute(path: '/profile/details', builder: (_, __) => const ProfileDetailsScreen()),
+    GoRoute(path: '/help-support', builder: (_, __) => const HelpSupportScreen()),
     GoRoute(
       path: '/track/:trackingId',
       builder: (_, state) => LiveTrackingScreen(

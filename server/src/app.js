@@ -39,7 +39,13 @@ app.post('/api/auth/logout', protect, authController.logout);
 app.get('/api/users/profile', protect, (req, res) => res.json({ success: true, user: req.user.doc }));
 app.put('/api/users/profile', protect, async (req, res, next) => {
   try {
-    const updated = await User.findByIdAndUpdate(req.user.id, req.body, { new: true });
+    const allowedUpdates = {};
+    if (typeof req.body.name === 'string' && req.body.name.trim()) allowedUpdates.name = req.body.name.trim();
+    if (typeof req.body.phone === 'string' && req.body.phone.trim()) allowedUpdates.phone = req.body.phone.trim();
+    if (typeof req.body.avatarUrl === 'string') allowedUpdates.avatarUrl = req.body.avatarUrl;
+    if (req.body.preferences && typeof req.body.preferences === 'object') allowedUpdates.preferences = req.body.preferences;
+
+    const updated = await User.findByIdAndUpdate(req.user.id, { $set: allowedUpdates }, { new: true, runValidators: true });
     res.json({ success: true, user: updated });
   } catch (err) { next(err); }
 });
