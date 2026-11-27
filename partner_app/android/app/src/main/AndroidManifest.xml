@@ -14,7 +14,7 @@
     <application
         android:name="${applicationName}"
         android:label="SwiftRoute Partner"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/launcher_icon"
         android:usesCleartextTraffic="true">
 
         <activity
