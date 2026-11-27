@@ -18,6 +18,7 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
   bool _loading = true;
   String _currentAddress = 'Detecting location...';
   bool _locating = false;
+  DateTime? _lastBackPressAt;
 
   @override
   void initState() {
@@ -98,7 +99,27 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
     final activeShipment = _shipments.isNotEmpty ? _shipments.first : null;
     final recentShipments = _shipments.skip(1).take(4).toList();
 
-    return Scaffold(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        final now = DateTime.now();
+        if (_lastBackPressAt == null ||
+            now.difference(_lastBackPressAt!) > const Duration(seconds: 2)) {
+          _lastBackPressAt = now;
+          ScaffoldMessenger.of(context)
+            ..hideCurrentSnackBar()
+            ..showSnackBar(
+              const SnackBar(
+                content: Text('Press back again to exit SwiftRoute'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+        } else {
+          Navigator.of(context).maybePop();
+        }
+      },
+      child: Scaffold(
       backgroundColor: AppColors.background,
       body: SafeArea(
         child: Stack(
@@ -234,7 +255,7 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
                               if (activeShipment != null) {
                                 context.push('/track/${activeShipment['trackingId']}', extra: activeShipment);
                               } else {
-                                context.go('/orders');
+                                context.push('/orders');
                               }
                             },
                           ),
@@ -246,7 +267,7 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text('Current Shipment', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontSize: 16)),
-                        GestureDetector(onTap: () => context.go('/orders'), child: Text('See All', style: Theme.of(context).textTheme.bodySmall)),
+                        GestureDetector(onTap: () => context.push('/orders'), child: Text('See All', style: Theme.of(context).textTheme.bodySmall)),
                       ],
                     ),
                     const SizedBox(height: 12),
@@ -269,7 +290,7 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text('Recent Shipment', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontSize: 16)),
-                        GestureDetector(onTap: () => context.go('/orders'), child: Text('See All', style: Theme.of(context).textTheme.bodySmall)),
+                        GestureDetector(onTap: () => context.push('/orders'), child: Text('See All', style: Theme.of(context).textTheme.bodySmall)),
                       ],
                     ),
                     const SizedBox(height: 12),
@@ -311,7 +332,7 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceAround,
                   children: [
                     _DockNavItem(icon: Icons.home_rounded, label: 'Home', isActive: true, onTap: () {}),
-                    _DockNavItem(icon: Icons.inventory_2_outlined, label: 'Shipment', isActive: false, onTap: () => context.go('/orders')),
+                    _DockNavItem(icon: Icons.inventory_2_outlined, label: 'Shipment', isActive: false, onTap: () => context.push('/orders')),
                     GestureDetector(
                       onTap: () => context.push('/booking').then((_) => _fetchShipments()),
                       child: Container(
@@ -329,11 +350,11 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
                         if (activeShipment != null) {
                           context.push('/track/${activeShipment['trackingId']}', extra: activeShipment);
                         } else {
-                          context.go('/orders');
+                          context.push('/orders');
                         }
                       },
                     ),
-                    _DockNavItem(icon: Icons.person_outline_rounded, label: 'Profile', isActive: false, onTap: () => context.go('/profile')),
+                    _DockNavItem(icon: Icons.person_outline_rounded, label: 'Profile', isActive: false, onTap: () => context.push('/profile')),
                   ],
                 ),
               ),
@@ -341,6 +362,7 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
           ],
         ),
       ),
+    ),
     );
   }
 }

@@ -46,7 +46,7 @@ exports.loginAgent = async (req, res, next) => {
 exports.toggleAvailability = async (req, res, next) => {
   try {
     const { isOnline, lat, lng } = req.body;
-    const update = { isOnline, isAvailable: true };
+    const update = { isOnline, isAvailable: true, lastSeenAt: isOnline ? new Date() : null };
     if (lat !== undefined && lng !== undefined) {
       update.currentLocation = { type: 'Point', coordinates: [Number(lng), Number(lat)] };
     }

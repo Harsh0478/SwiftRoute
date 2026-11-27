@@ -4,9 +4,22 @@ const { Server } = require('socket.io');
 const connectDB = require('./config/db');
 const app = require('./app');
 const initializeSockets = require('./sockets');
+const DeliveryAgent = require('./models/DeliveryAgent');
 
 const startServer = async () => {
   await connectDB();
+
+  // Clear stale online agents left over before Render spun down
+  await DeliveryAgent.updateMany(
+    {
+      isOnline: true,
+      $or: [
+        { lastSeenAt: null },
+        { lastSeenAt: { $lt: new Date(Date.now() - 2 * 60 * 1000) } },
+      ],
+    },
+    { $set: { isOnline: false, lastSeenAt: null } }
+  );
 
   const server = http.createServer(app);
   const io = new Server(server, {

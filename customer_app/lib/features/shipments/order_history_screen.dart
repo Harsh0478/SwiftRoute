@@ -41,7 +41,14 @@ class _OrderHistoryScreenState extends ConsumerState<OrderHistoryScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return PopScope(
+      canPop: context.canPop(),
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          context.go('/home');
+        }
+      },
+      child: Scaffold(
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.center, colors: [AppColors.secondaryCream, AppColors.background]),
@@ -55,7 +62,13 @@ class _OrderHistoryScreenState extends ConsumerState<OrderHistoryScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     GestureDetector(
-                      onTap: () => context.go('/home'),
+                      onTap: () {
+                        if (context.canPop()) {
+                          context.pop();
+                        } else {
+                          context.go('/home');
+                        }
+                      },
                       child: const CircleAvatar(backgroundColor: AppColors.white, child: Icon(Icons.chevron_left_rounded, color: AppColors.primaryText)),
                     ),
                     const Text('Order History', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 18)),
@@ -240,6 +253,7 @@ class _OrderHistoryScreenState extends ConsumerState<OrderHistoryScreen> {
           ),
         ),
       ),
+    ),
     );
   }
 }

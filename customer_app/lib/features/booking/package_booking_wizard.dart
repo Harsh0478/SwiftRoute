@@ -256,7 +256,8 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
       setState(() {
         _nearbyAgentsCount = (res.data['count'] as num?)?.toInt() ?? 0;
         _nearestAgentName = nearest?['name']?.toString();
-        _nearestAgentDistanceKm = (nearest?['distanceKm'] as num?)?.toDouble();
+        _nearestAgentDistanceKm =
+            (nearest?['distanceKm'] as num?)?.toDouble();
       });
     } catch (_) {
       if (!mounted) return;
@@ -387,7 +388,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
           ],
         ),
         content: const Text(
-          'No online delivery partner is available within 18 km of your pickup location right now.Please try again later.',
+          'No online delivery partner is available within 18 km of your pickup location right now.You can retry searching, or enable Development Mode in Profile to send parcels directly during testing.',
           style: TextStyle(fontSize: 13.5),
         ),
         actions: [
@@ -430,7 +431,8 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
         endLat: _deliveryLat,
         endLng: _deliveryLng,
       );
-      final speedOptions = MapboxGeocodingService.calculateDeliverySpeedOptions(
+      final speedOptions =
+          MapboxGeocodingService.calculateDeliverySpeedOptions(
         distanceKm: routeEstimate.distanceKm,
         weightKg: double.tryParse(_weightCtrl.text) ?? 1.0,
         isFragile: _isFragile,
@@ -814,7 +816,14 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
       orElse: () => speedOptions.firstWhere((opt) => opt.type == 'express'),
     );
 
-    return Scaffold(
+    return PopScope(
+      canPop: _step == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _step > 0) {
+          setState(() => _step--);
+        }
+      },
+      child: Scaffold(
       appBar: AppBar(
         title: Text(stepTitles[_step]),
         backgroundColor: AppColors.background,
@@ -1262,6 +1271,7 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
           ],
         ),
       ),
+    ),
     );
   }
 }

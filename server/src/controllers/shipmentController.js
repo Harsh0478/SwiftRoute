@@ -39,10 +39,12 @@ async function findNearbyAgents(pickupCoords, radiusKm = NEARBY_COURIER_RADIUS_K
   const maxMeters = radiusKm * 1000;
 
   try {
+    const activeThreshold = new Date(Date.now() - 3 * 60 * 1000);
     const agents = await DeliveryAgent.find({
       isOnline: true,
       isAvailable: true,
       kycStatus: 'approved',
+      lastSeenAt: { $gte: activeThreshold },
       currentLocation: {
         $near: {
           $geometry: { type: 'Point', coordinates: [Number(pickupLng), Number(pickupLat)] },
@@ -64,6 +66,7 @@ async function findNearbyAgents(pickupCoords, radiusKm = NEARBY_COURIER_RADIUS_K
       isOnline: true,
       isAvailable: true,
       kycStatus: 'approved',
+      lastSeenAt: { $gte: activeThreshold },
     });
 
     return onlineAgents
@@ -163,7 +166,8 @@ exports.createShipment = async (req, res, next) => {
         isOnline: true,
         isAvailable: true,
         kycStatus: 'approved',
-      }).sort({ updatedAt: -1 });
+        lastSeenAt: { $gte: new Date(Date.now() - 3 * 60 * 1000) },
+      }).sort({ lastSeenAt: -1 });
     }
 
     let imageUrl = packageDetails.imageUrl || '';

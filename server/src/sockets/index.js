@@ -20,6 +20,35 @@ const initializeSockets = (io) => {
   io.on('connection', (socket) => {
     socket.join(`user:${socket.user.id}`);
 
+    if (socket.user.role === 'agent') {
+      DeliveryAgent.findByIdAndUpdate(socket.user.id, {
+        isOnline: true,
+        lastSeenAt: new Date(),
+      }).catch(() => {});
+
+      socket.on('agent:heartbeat', async ({ lat, lng } = {}) => {
+        try {
+          const update = { isOnline: true, lastSeenAt: new Date() };
+          if (lat !== undefined && lng !== undefined) {
+            update.currentLocation = { type: 'Point', coordinates: [Number(lng), Number(lat)] };
+          }
+          await DeliveryAgent.findByIdAndUpdate(socket.user.id, update);
+        } catch (_) {}
+      });
+
+      socket.on('disconnect', async () => {
+        try {
+          const room = io.sockets.adapter.rooms.get(`user:${socket.user.id}`);
+          if (!room || room.size === 0) {
+            await DeliveryAgent.findByIdAndUpdate(socket.user.id, {
+              isOnline: false,
+              lastSeenAt: null,
+            });
+          }
+        } catch (_) {}
+      });
+    }
+
     socket.on('shipment:join', async ({ shipmentId }, ack) => {
       try {
         const shipment = await Shipment.findById(shipmentId);
@@ -52,6 +81,8 @@ const initializeSockets = (io) => {
           DeliveryAgent.findByIdAndUpdate(socket.user.id, {
             currentLocation: { type: 'Point', coordinates },
             heading,
+            isOnline: true,
+            lastSeenAt: new Date(),
           }),
           Shipment.findByIdAndUpdate(shipmentId, {
             currentLocation: { type: 'Point', coordinates },

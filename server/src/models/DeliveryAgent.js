@@ -13,6 +13,7 @@ const deliveryAgentSchema = new mongoose.Schema(
     licenseNumber: { type: String, required: true, trim: true },
     kycStatus: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'approved' },
     isOnline: { type: Boolean, default: false, index: true },
+    lastSeenAt: { type: Date, default: null, index: true },
     isAvailable: { type: Boolean, default: true, index: true },
     currentLocation: {
       type: { type: String, enum: ['Point'], default: 'Point' },

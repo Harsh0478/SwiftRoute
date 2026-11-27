@@ -484,6 +484,7 @@ class _PartnerDashboardScreenState
   geo.Position? _currentPosition;
 
   StreamSubscription<geo.Position>? _positionSub;
+  Timer? _heartbeatTimer;
 
   List<dynamic> _assignments = [];
 
@@ -536,6 +537,7 @@ class _PartnerDashboardScreenState
 
       await _connectSocket();
       _startLocationTracking();
+      _startHeartbeatTimer();
 
       if (!mounted) return;
       setState(() {
@@ -729,8 +731,10 @@ class _PartnerDashboardScreenState
       if (value) {
         await _connectSocket();
         _startLocationTracking();
+        _startHeartbeatTimer();
         await _loadAssignments();
       } else {
+        _stopHeartbeatTimer();
         await _stopLocationTracking();
         _disconnectSocket();
       }
@@ -1052,8 +1056,38 @@ class _PartnerDashboardScreenState
   // DISPOSE
   // ==========================================================
 
+  void _startHeartbeatTimer() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 45), (_) async {
+      if (!_isOnline) return;
+      final pos = _currentPosition ?? await _acquireCurrentPosition();
+      try {
+        await _dio.put(
+          '/agents/availability',
+          data: {
+            'isOnline': true,
+            if (pos != null) 'lat': pos.latitude,
+            if (pos != null) 'lng': pos.longitude,
+          },
+        );
+      } catch (_) {}
+      if (_socket != null && _socket!.connected) {
+        _socket!.emit('agent:heartbeat', {
+          if (pos != null) 'lat': pos.latitude,
+          if (pos != null) 'lng': pos.longitude,
+        });
+      }
+    });
+  }
+
+  void _stopHeartbeatTimer() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+  }
+
   @override
   void dispose() {
+    _stopHeartbeatTimer();
     _positionSub?.cancel();
     _socket?.disconnect();
     _socket?.dispose();
@@ -1101,6 +1135,10 @@ class _PartnerDashboardScreenState
               tooltip: 'Logout',
               icon: const Icon(Icons.logout_rounded),
               onPressed: () async {
+                _stopHeartbeatTimer();
+                try {
+                  await _dio.put('/agents/availability', data: {'isOnline': false});
+                } catch (_) {}
                 await _stopLocationTracking();
                 _disconnectSocket();
                 await widget.onLogout!();
