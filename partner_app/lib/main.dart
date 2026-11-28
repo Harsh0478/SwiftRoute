@@ -2,12 +2,17 @@ import 'dart:async';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:geolocator/geolocator.dart' as geo;
 import 'package:google_fonts/google_fonts.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:socket_io_client/socket_io_client.dart' as io;
+
+import 'features/chat/partner_chat_screen.dart';
+import 'features/map/partner_route_map_screen.dart';
 
 // ============================================================
 // CONFIGURATION
@@ -454,7 +459,7 @@ class _PartnerAuthScreenState extends State<PartnerAuthScreen> {
 }
 
 // ============================================================
-// PARTNER DASHBOARD
+// PARTNER DASHBOARD & MULTI-TAB WORKSPACE
 // ============================================================
 
 class PartnerDashboardScreen extends ConsumerStatefulWidget {
@@ -469,28 +474,29 @@ class PartnerDashboardScreen extends ConsumerStatefulWidget {
 
 class _PartnerDashboardScreenState
     extends ConsumerState<PartnerDashboardScreen> {
-  // API
   final Dio _dio = _createDio();
-
-  // Socket
+  final ImagePicker _imagePicker = ImagePicker();
   io.Socket? _socket;
 
-  // State
+  int _navIndex = 0;
   bool _isOnline = false;
   bool _isLoading = true;
   bool _isUpdatingAvailability = false;
+  bool _isBroadcastingGps = false;
+  String? _uploadingProofShipmentId;
 
   String? _errorMessage;
   geo.Position? _currentPosition;
+  DateTime? _lastLocationSyncedAt;
 
   StreamSubscription<geo.Position>? _positionSub;
   Timer? _heartbeatTimer;
 
+  Map<String, dynamic>? _agentProfile;
   List<dynamic> _assignments = [];
-
-  // ==========================================================
-  // INIT
-  // ==========================================================
+  final Map<String, int> _unreadChatCounts = {};
+  String? _activeChatShipmentId;
+  String? _mapFocusedShipmentId;
 
   @override
   void initState() {
@@ -499,8 +505,27 @@ class _PartnerDashboardScreenState
   }
 
   Future<void> _initPartnerSession() async {
-    await _loadAssignments();
+    await Future.wait([
+      _loadAssignments(),
+      _loadAgentProfile(),
+    ]);
     await _syncInitialLocationAndAvailability();
+  }
+
+  Future<void> _loadAgentProfile() async {
+    try {
+      final token = await _secureStorage.read(key: 'agent_token');
+      if (token == null || token.isEmpty) return;
+      _dio.options.headers['Authorization'] = 'Bearer $token';
+
+      final res = await _dio.get('/agents/profile');
+      if (!mounted) return;
+      setState(() {
+        _agentProfile = Map<String, dynamic>.from(res.data['agent'] ?? {});
+      });
+    } catch (e) {
+      debugPrint('Profile load warning: $e');
+    }
   }
 
   Future<void> _syncInitialLocationAndAvailability() async {
@@ -509,7 +534,6 @@ class _PartnerDashboardScreenState
 
     _dio.options.headers['Authorization'] = 'Bearer $token';
 
-    // Request location permission & acquire current location immediately on launch
     final hasPermission = await _checkLocationPermission(silent: true);
     if (!hasPermission) return;
 
@@ -518,14 +542,14 @@ class _PartnerDashboardScreenState
 
     setState(() {
       _currentPosition = pos;
+      _lastLocationSyncedAt = DateTime.now();
     });
 
     try {
-      // Check current partner profile status on server
       final profileRes = await _dio.get('/agents/profile');
-      final serverOnline = profileRes.data['agent']?['isOnline'] == true;
+      final agentMap = Map<String, dynamic>.from(profileRes.data['agent'] ?? {});
+      final serverOnline = agentMap['isOnline'] == true;
 
-      // Sync latest GPS coordinates to backend and go online automatically
       await _dio.put(
         '/agents/availability',
         data: {
@@ -536,11 +560,13 @@ class _PartnerDashboardScreenState
       );
 
       await _connectSocket();
+      _joinAllAssignmentRooms();
       _startLocationTracking();
       _startHeartbeatTimer();
 
       if (!mounted) return;
       setState(() {
+        _agentProfile = agentMap;
         _isOnline = true;
       });
 
@@ -564,10 +590,6 @@ class _PartnerDashboardScreenState
       return await geo.Geolocator.getLastKnownPosition();
     }
   }
-
-  // ==========================================================
-  // LOAD ASSIGNMENTS
-  // ==========================================================
 
   Future<void> _loadAssignments() async {
     if (mounted) {
@@ -603,6 +625,9 @@ class _PartnerDashboardScreenState
         _assignments = response.data['shipments'] ?? [];
         _isLoading = false;
       });
+
+      _joinAllAssignmentRooms();
+      await _refreshUnreadCounts();
     } on DioException catch (e) {
       if (e.response?.statusCode == 401 && widget.onLogout != null) {
         await widget.onLogout!();
@@ -615,27 +640,44 @@ class _PartnerDashboardScreenState
         _errorMessage =
             e.response?.data?['message'] ?? 'Failed to load assignments.';
       });
-
-      debugPrint('Assignment API error: ${e.message}');
     } catch (e) {
       if (!mounted) return;
-
       setState(() {
         _isLoading = false;
         _errorMessage = 'Something went wrong.';
       });
-
-      debugPrint('Assignment error: $e');
     }
   }
 
-  // ==========================================================
-  // LOCATION PERMISSION
-  // ==========================================================
+  void _joinAllAssignmentRooms() {
+    if (_socket == null || !_socket!.connected) return;
+    for (final shipment in _assignments) {
+      final id = shipment['_id']?.toString();
+      if (id != null && id.isNotEmpty) {
+        _socket!.emit('shipment:join', {'shipmentId': id});
+      }
+    }
+  }
+
+  Future<void> _refreshUnreadCounts() async {
+    for (final shipment in _assignments) {
+      final id = shipment['_id']?.toString();
+      if (id == null || id.isEmpty) continue;
+      try {
+        final res = await _dio.get('/chat/$id/messages');
+        final msgs = List<dynamic>.from(res.data['messages'] ?? []);
+        final unread = msgs
+            .where((m) => m['senderRole'] != 'agent' && m['isRead'] != true)
+            .length;
+        if (mounted) {
+          setState(() => _unreadChatCounts[id] = unread);
+        }
+      } catch (_) {}
+    }
+  }
 
   Future<bool> _checkLocationPermission({bool silent = false}) async {
-    bool serviceEnabled =
-        await geo.Geolocator.isLocationServiceEnabled();
+    final serviceEnabled = await geo.Geolocator.isLocationServiceEnabled();
 
     if (!serviceEnabled) {
       if (!mounted || silent) return false;
@@ -645,13 +687,11 @@ class _PartnerDashboardScreenState
         builder: (context) => AlertDialog(
           title: const Text('Location Services Disabled'),
           content: const Text(
-            'Please enable location services to share your live location.',
+            'Please enable GPS location services to share your live location with customers.',
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.pop(context);
-              },
+              onPressed: () => Navigator.pop(context),
               child: const Text('Cancel'),
             ),
             ElevatedButton(
@@ -659,7 +699,7 @@ class _PartnerDashboardScreenState
                 Navigator.pop(context);
                 await geo.Geolocator.openLocationSettings();
               },
-              child: const Text('Settings'),
+              child: const Text('Open Settings'),
             ),
           ],
         ),
@@ -668,8 +708,7 @@ class _PartnerDashboardScreenState
       return false;
     }
 
-    geo.LocationPermission permission =
-        await geo.Geolocator.checkPermission();
+    geo.LocationPermission permission = await geo.Geolocator.checkPermission();
 
     if (permission == geo.LocationPermission.denied) {
       permission = await geo.Geolocator.requestPermission();
@@ -681,7 +720,7 @@ class _PartnerDashboardScreenState
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Location permission is required.'),
+          content: Text('Location permission is required to go online.'),
         ),
       );
 
@@ -691,22 +730,14 @@ class _PartnerDashboardScreenState
     return true;
   }
 
-  // ==========================================================
-  // ONLINE / OFFLINE
-  // ==========================================================
-
   Future<void> _toggleOnline(bool value) async {
     if (_isUpdatingAvailability) return;
 
-    setState(() {
-      _isUpdatingAvailability = true;
-    });
+    setState(() => _isUpdatingAvailability = true);
 
     try {
       final hasPermission = await _checkLocationPermission();
-      if (!hasPermission) {
-        return;
-      }
+      if (!hasPermission) return;
 
       final geo.Position? position = await _acquireCurrentPosition();
       if (position == null) {
@@ -730,6 +761,7 @@ class _PartnerDashboardScreenState
 
       if (value) {
         await _connectSocket();
+        _joinAllAssignmentRooms();
         _startLocationTracking();
         _startHeartbeatTimer();
         await _loadAssignments();
@@ -743,6 +775,7 @@ class _PartnerDashboardScreenState
 
       setState(() {
         _currentPosition = position;
+        _lastLocationSyncedAt = DateTime.now();
         _isOnline = value;
       });
 
@@ -753,54 +786,75 @@ class _PartnerDashboardScreenState
             value
                 ? (claimed > 0
                     ? 'You are online! $claimed pending order(s) assigned.'
-                    : 'You are now online.')
+                    : 'You are now online and sharing live GPS.')
                 : 'You are now offline.',
           ),
         ),
       );
     } on DioException catch (e) {
-      debugPrint('Availability API error: ${e.message}');
-
       if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            e.response?.data?['message'] ??
-                'Failed to update availability.',
+            e.response?.data?['message'] ?? 'Failed to update availability.',
           ),
         ),
       );
-    } catch (e) {
-      debugPrint('Online toggle error: $e');
-
+    } catch (_) {
       if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Something went wrong.'),
-        ),
+        const SnackBar(content: Text('Something went wrong.')),
       );
     } finally {
       if (mounted) {
-        setState(() {
-          _isUpdatingAvailability = false;
-        });
+        setState(() => _isUpdatingAvailability = false);
       }
     }
   }
 
-  // ==========================================================
-  // SOCKET CONNECTION
-  // ==========================================================
+  Future<void> _broadcastLocationNow({bool showToast = true}) async {
+    if (_isBroadcastingGps) return;
+    setState(() => _isBroadcastingGps = true);
+
+    try {
+      final hasPermission = await _checkLocationPermission();
+      if (!hasPermission) return;
+
+      final pos = await _acquireCurrentPosition();
+      if (pos == null) {
+        if (mounted && showToast) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Could not get current GPS coordinates.')),
+          );
+        }
+        return;
+      }
+
+      await _sendLocation(pos);
+      if (!mounted) return;
+      setState(() {
+        _currentPosition = pos;
+        _lastLocationSyncedAt = DateTime.now();
+      });
+
+      if (showToast) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Location updated: ${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}',
+            ),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isBroadcastingGps = false);
+    }
+  }
 
   Future<void> _connectSocket() async {
     final token = await _secureStorage.read(key: 'agent_token');
-
-    if (token == null) {
-      debugPrint('Socket connection failed: token missing');
-      return;
-    }
+    if (token == null) return;
 
     _disconnectSocket();
 
@@ -815,35 +869,58 @@ class _PartnerDashboardScreenState
     );
 
     _socket!.onConnect((_) {
-      debugPrint('Socket connected: ${_socket?.id}');
+      debugPrint('Partner socket connected: ${_socket?.id}');
+      _joinAllAssignmentRooms();
     });
 
-    _socket!.onDisconnect((_) {
-      debugPrint('Socket disconnected');
-    });
-
-    _socket!.onConnectError((error) {
-      debugPrint('Socket connection error: $error');
-    });
-
-    _socket!.onError((error) {
-      debugPrint('Socket error: $error');
-    });
-
-    // Listen for both event names emitted by server controllers
     void handleNewAssignment(dynamic data) {
-      debugPrint('New shipment assigned: $data');
       _loadAssignments();
+      _loadAgentProfile();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('New shipment assigned!'),
+          content: Text('New delivery request received! Tap Accept Order to start.'),
+          backgroundColor: Color(0xFF42B883),
         ),
       );
     }
 
     _socket!.on('agent:new_assignment', handleNewAssignment);
     _socket!.on('shipment:assigned', handleNewAssignment);
+
+    _socket!.on('chat:new_message', (dynamic data) {
+      if (!mounted || data is! Map) return;
+      final senderRole = data['senderRole']?.toString();
+      final shipmentId = data['shipmentId']?.toString();
+      if (senderRole == 'agent' || shipmentId == null) return;
+
+      if (_activeChatShipmentId == shipmentId) {
+        return;
+      }
+
+      setState(() {
+        _unreadChatCounts[shipmentId] = (_unreadChatCounts[shipmentId] ?? 0) + 1;
+      });
+
+      final text = data['text']?.toString() ?? 'New message from customer';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Customer message: $text'),
+          action: SnackBarAction(
+            label: 'Reply',
+            onPressed: () {
+              final match = _assignments.cast<Map<String, dynamic>?>().firstWhere(
+                    (s) => s?['_id']?.toString() == shipmentId,
+                    orElse: () => null,
+                  );
+              if (match != null) {
+                _openChatScreen(match);
+              }
+            },
+          ),
+        ),
+      );
+    });
 
     _socket!.connect();
   }
@@ -854,23 +931,20 @@ class _PartnerDashboardScreenState
     _socket = null;
   }
 
-  // ==========================================================
-  // GPS TRACKING
-  // ==========================================================
-
   void _startLocationTracking() {
     _positionSub?.cancel();
 
     _positionSub = geo.Geolocator.getPositionStream(
       locationSettings: const geo.LocationSettings(
         accuracy: geo.LocationAccuracy.high,
-        distanceFilter: 15,
+        distanceFilter: 10,
       ),
     ).listen(
       (geo.Position position) {
         if (mounted) {
           setState(() {
             _currentPosition = position;
+            _lastLocationSyncedAt = DateTime.now();
           });
         }
         _sendLocation(position);
@@ -882,7 +956,6 @@ class _PartnerDashboardScreenState
   }
 
   Future<void> _sendLocation(geo.Position position) async {
-    // Keep backend agent coordinates updated via REST
     try {
       await _dio.put(
         '/agents/availability',
@@ -894,11 +967,8 @@ class _PartnerDashboardScreenState
       );
     } catch (_) {}
 
-    if (_socket == null || !_socket!.connected) {
-      return;
-    }
+    if (_socket == null || !_socket!.connected) return;
 
-    // Emit live tracking for every active assignment
     for (final shipment in _assignments) {
       final shipmentId = shipment['_id']?.toString();
       if (shipmentId != null && shipmentId.isNotEmpty) {
@@ -918,22 +988,175 @@ class _PartnerDashboardScreenState
     _positionSub = null;
   }
 
-  // ==========================================================
-  // SHIPMENT STATUS
-  // ==========================================================
+  Future<void> _openChatScreen(Map<String, dynamic> shipment) async {
+    final shipmentId = shipment['_id']?.toString() ?? '';
+    if (shipmentId.isEmpty) return;
+
+    final trackingId = shipment['trackingId']?.toString() ?? 'N/A';
+    final customerName = shipment['customerId']?['name']?.toString() ??
+        shipment['sender']?['name']?.toString() ??
+        'Customer';
+    final status = shipment['shipmentStatus']?.toString() ?? 'Active';
+
+    setState(() {
+      _activeChatShipmentId = shipmentId;
+      _unreadChatCounts[shipmentId] = 0;
+    });
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => PartnerChatScreen(
+          dio: _dio,
+          socket: _socket,
+          shipmentId: shipmentId,
+          trackingId: trackingId,
+          customerName: customerName,
+          shipmentStatus: status,
+        ),
+      ),
+    );
+
+    if (mounted) {
+      setState(() {
+        _activeChatShipmentId = null;
+        _unreadChatCounts[shipmentId] = 0;
+      });
+    }
+  }
+
+  Future<void> _uploadProofPhoto(String shipmentId, String proofType) async {
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 12),
+            Text(
+              proofType == 'pickup' ? 'Upload Pickup Proof' : 'Upload Delivery Proof',
+              style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+            ),
+            ListTile(
+              leading: const Icon(Icons.camera_alt_rounded, color: Color(0xFFF99A4F)),
+              title: const Text('Take Photo with Camera'),
+              onTap: () => Navigator.pop(ctx, ImageSource.camera),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_rounded, color: Color(0xFFF99A4F)),
+              title: const Text('Choose from Gallery'),
+              onTap: () => Navigator.pop(ctx, ImageSource.gallery),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+
+    if (source == null) return;
+
+    try {
+      final XFile? picked = await _imagePicker.pickImage(
+        source: source,
+        imageQuality: 80,
+        maxWidth: 1400,
+      );
+      if (picked == null) return;
+
+      setState(() => _uploadingProofShipmentId = shipmentId);
+
+      final formData = FormData.fromMap({
+        'proofType': proofType,
+        'proofImage': await MultipartFile.fromFile(
+          picked.path,
+          filename: picked.name,
+        ),
+      });
+
+      await _dio.post(
+        '/agents/shipments/$shipmentId/proof',
+        data: formData,
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${proofType == 'pickup' ? 'Pickup' : 'Delivery'} photo proof uploaded!',
+          ),
+        ),
+      );
+      await _loadAssignments();
+    } on DioException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.response?.data?['message'] ?? 'Failed to upload proof photo.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _uploadingProofShipmentId = null);
+    }
+  }
+
+  Future<void> _respondToOffer(
+    String shipmentId, {
+    required bool accept,
+  }) async {
+    try {
+      await _dio.put(
+        '/agents/shipments/$shipmentId/${accept ? 'accept' : 'decline'}',
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            accept
+                ? 'Order accepted! Tap "Going to Collect Package" when heading to pickup.'
+                : 'Order declined and reassigned to the next available partner.',
+          ),
+          backgroundColor: accept ? const Color(0xFF42B883) : Colors.black87,
+        ),
+      );
+      await Future.wait([
+        _loadAssignments(),
+        _loadAgentProfile(),
+      ]);
+    } on DioException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.response?.data?['message'] ?? 'Unable to respond to order.',
+          ),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Something went wrong.')),
+      );
+    }
+  }
 
   Future<void> _advanceStatus(
     String shipmentId,
     String nextStatus,
   ) async {
+    if (nextStatus == 'Order Confirmed') {
+      await _respondToOffer(shipmentId, accept: true);
+      return;
+    }
+
     String? otp;
 
     if (nextStatus == 'Delivered') {
       otp = await _showOtpDialog();
-
-      if (otp == null || otp.isEmpty) {
-        return;
-      }
+      if (otp == null || otp.isEmpty) return;
     }
 
     try {
@@ -941,7 +1164,7 @@ class _PartnerDashboardScreenState
         '/agents/shipments/$shipmentId/status',
         data: {
           'status': nextStatus,
-          'deliveryOtp': otp,
+          if (otp != null) 'deliveryOtp': otp,
         },
       );
 
@@ -953,36 +1176,26 @@ class _PartnerDashboardScreenState
         ),
       );
 
-      await _loadAssignments();
+      await Future.wait([
+        _loadAssignments(),
+        _loadAgentProfile(),
+      ]);
     } on DioException catch (e) {
-      debugPrint('Shipment status error: ${e.message}');
-
       if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            e.response?.data?['message'] ??
-                'Failed to update shipment status.',
+            e.response?.data?['message'] ?? 'Failed to update shipment status.',
           ),
         ),
       );
-    } catch (e) {
-      debugPrint('Status update error: $e');
-
+    } catch (_) {
       if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Something went wrong.'),
-        ),
+        const SnackBar(content: Text('Something went wrong.')),
       );
     }
   }
-
-  // ==========================================================
-  // OTP DIALOG
-  // ==========================================================
 
   Future<String?> _showOtpDialog() async {
     final controller = TextEditingController();
@@ -992,69 +1205,65 @@ class _PartnerDashboardScreenState
       barrierDismissible: false,
       builder: (context) => AlertDialog(
         title: const Text('Delivery Verification'),
-        content: TextField(
-          controller: controller,
-          keyboardType: TextInputType.number,
-          maxLength: 4,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: 'Delivery OTP',
-            hintText: 'Enter 4-digit OTP',
-            border: OutlineInputBorder(),
-          ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Ask the customer or receiver for their 4-digit Delivery OTP shown in the Customer App.',
+              style: TextStyle(fontSize: 12.5, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              keyboardType: TextInputType.number,
+              maxLength: 4,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Delivery OTP',
+                hintText: 'Enter 4-digit PIN',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
         ),
         actions: [
           TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-            },
+            onPressed: () => Navigator.pop(context),
             child: const Text('Cancel'),
           ),
           ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFF99A4F),
+              foregroundColor: Colors.white,
+            ),
             onPressed: () {
               final otp = controller.text.trim();
-
               if (otp.length != 4) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Enter a valid 4-digit OTP.'),
-                  ),
+                  const SnackBar(content: Text('Enter a valid 4-digit OTP.')),
                 );
-
                 return;
               }
-
               Navigator.pop(context, otp);
             },
-            child: const Text('Verify'),
+            child: const Text('Verify & Complete'),
           ),
         ],
       ),
     );
 
     controller.dispose();
-
     return result;
   }
 
-  // ==========================================================
-  // REFRESH
-  // ==========================================================
-
   Future<void> _refreshAssignments() async {
-    final pos = await _acquireCurrentPosition();
-    if (pos != null && mounted) {
-      setState(() => _currentPosition = pos);
-      if (_isOnline) {
-        await _sendLocation(pos);
-      }
-    }
-    await _loadAssignments();
+    await _broadcastLocationNow(showToast: false);
+    await Future.wait([
+      _loadAssignments(),
+      _loadAgentProfile(),
+    ]);
   }
-
-  // ==========================================================
-  // DISPOSE
-  // ==========================================================
 
   void _startHeartbeatTimer() {
     _heartbeatTimer?.cancel();
@@ -1091,67 +1300,107 @@ class _PartnerDashboardScreenState
     _positionSub?.cancel();
     _socket?.disconnect();
     _socket?.dispose();
-
     super.dispose();
   }
 
-  // ==========================================================
-  // UI
-  // ==========================================================
+  int get _totalUnreadMessages =>
+      _unreadChatCounts.values.fold(0, (sum, count) => sum + count);
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'Courier Partner',
-          style: TextStyle(
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        actions: [
-          Row(
-            children: [
-              Text(
-                _isOnline ? 'ONLINE' : 'OFFLINE',
-                style: TextStyle(
-                  fontWeight: FontWeight.w700,
-                  color: _isOnline
-                      ? const Color(0xFF42B883)
-                      : Colors.grey,
+      appBar: _navIndex == 1
+          ? null
+          : AppBar(
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'SwiftRoute Partner',
+                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 18),
+                  ),
+                  if (_agentProfile?['name'] != null)
+                    Text(
+                      '${_agentProfile!['name']} • ${(_agentProfile!['vehicleNumber'] ?? '').toString()}',
+                      style: const TextStyle(fontSize: 11.5, color: Colors.grey),
+                    ),
+                ],
+              ),
+              actions: [
+                Row(
+                  children: [
+                    Text(
+                      _isOnline ? 'ONLINE' : 'OFFLINE',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12,
+                        color: _isOnline
+                            ? const Color(0xFF42B883)
+                            : Colors.grey,
+                      ),
+                    ),
+                    Switch(
+                      value: _isOnline,
+                      activeThumbColor: const Color(0xFF42B883),
+                      onChanged:
+                          _isUpdatingAvailability ? null : _toggleOnline,
+                    ),
+                  ],
                 ),
-              ),
-              Switch(
-                value: _isOnline,
-                activeThumbColor: const Color(0xFF42B883),
-                onChanged: _isUpdatingAvailability
-                    ? null
-                    : _toggleOnline,
-              ),
+                const SizedBox(width: 6),
+              ],
+            ),
+      body: IndexedStack(
+        index: _navIndex,
+        children: [
+          Column(
+            children: [
+              _buildLocationBanner(),
+              Expanded(child: _buildDeliveriesBody()),
             ],
           ),
-          if (widget.onLogout != null)
-            IconButton(
-              tooltip: 'Logout',
-              icon: const Icon(Icons.logout_rounded),
-              onPressed: () async {
-                _stopHeartbeatTimer();
-                try {
-                  await _dio.put('/agents/availability', data: {'isOnline': false});
-                } catch (_) {}
-                await _stopLocationTracking();
-                _disconnectSocket();
-                await widget.onLogout!();
-              },
-            ),
-          const SizedBox(width: 4),
+          PartnerRouteMapScreen(
+            mapboxAccessToken: mapboxPublicToken,
+            currentPosition: _currentPosition,
+            assignments: _assignments,
+            initialShipmentId: _mapFocusedShipmentId,
+            isOnline: _isOnline,
+            onBroadcastLocationNow: () => _broadcastLocationNow(showToast: true),
+            onOpenChat: (shipment) => _openChatScreen(shipment),
+            onAdvanceStatus: (id, nextStatus) => _advanceStatus(id, nextStatus),
+          ),
+          _buildProfileAndEarningsTab(),
         ],
       ),
-
-      body: Column(
-        children: [
-          _buildLocationBanner(),
-          Expanded(child: _buildBody()),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _navIndex,
+        backgroundColor: Colors.white,
+        indicatorColor: const Color(0xFFF9EDE8),
+        onDestinationSelected: (idx) => setState(() => _navIndex = idx),
+        destinations: [
+          NavigationDestination(
+            icon: Badge(
+              isLabelVisible: _totalUnreadMessages > 0,
+              label: Text('$_totalUnreadMessages'),
+              child: const Icon(Icons.local_shipping_outlined),
+            ),
+            selectedIcon: Badge(
+              isLabelVisible: _totalUnreadMessages > 0,
+              label: Text('$_totalUnreadMessages'),
+              child: const Icon(Icons.local_shipping_rounded, color: Color(0xFFF99A4F)),
+            ),
+            label: 'Deliveries',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.map_outlined),
+            selectedIcon: Icon(Icons.map_rounded, color: Color(0xFFF99A4F)),
+            label: 'Live Map',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.person_outline_rounded),
+            selectedIcon: Icon(Icons.person_rounded, color: Color(0xFFF99A4F)),
+            label: 'Earnings',
+          ),
         ],
       ),
     );
@@ -1159,24 +1408,23 @@ class _PartnerDashboardScreenState
 
   Widget _buildLocationBanner() {
     final hasGps = _currentPosition != null;
+    final syncedLabel = _lastLocationSyncedAt != null
+        ? ' • Synced ${_lastLocationSyncedAt!.hour.toString().padLeft(2, '0')}:${_lastLocationSyncedAt!.minute.toString().padLeft(2, '0')}'
+        : '';
     final label = hasGps
-        ? 'GPS Active: ${_currentPosition!.latitude.toStringAsFixed(4)}, ${_currentPosition!.longitude.toStringAsFixed(4)}'
+        ? 'GPS: ${_currentPosition!.latitude.toStringAsFixed(4)}, ${_currentPosition!.longitude.toStringAsFixed(4)}$syncedLabel'
         : 'Acquiring current GPS location...';
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: hasGps
-          ? const Color(0xFFEAF7F1)
-          : const Color(0xFFFFF4E8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+      color: hasGps ? const Color(0xFFEAF7F1) : const Color(0xFFFFF4E8),
       child: Row(
         children: [
           Icon(
             hasGps ? Icons.my_location : Icons.location_searching,
             size: 16,
-            color: hasGps
-                ? const Color(0xFF2E9E6B)
-                : const Color(0xFFF99A4F),
+            color: hasGps ? const Color(0xFF2E9E6B) : const Color(0xFFF99A4F),
           ),
           const SizedBox(width: 8),
           Expanded(
@@ -1189,15 +1437,18 @@ class _PartnerDashboardScreenState
                     ? const Color(0xFF1F7A50)
                     : const Color(0xFFB86621),
               ),
+              overflow: TextOverflow.ellipsis,
             ),
           ),
           InkWell(
-            onTap: _refreshAssignments,
-            child: const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            onTap: _isBroadcastingGps
+                ? null
+                : () => _broadcastLocationNow(showToast: true),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
               child: Text(
-                'Sync',
-                style: TextStyle(
+                _isBroadcastingGps ? 'Updating...' : 'Update GPS',
+                style: const TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w700,
                   color: Color(0xFFF99A4F),
@@ -1210,15 +1461,9 @@ class _PartnerDashboardScreenState
     );
   }
 
-  // ==========================================================
-  // BODY
-  // ==========================================================
-
-  Widget _buildBody() {
+  Widget _buildDeliveriesBody() {
     if (_isLoading) {
-      return const Center(
-        child: CircularProgressIndicator(),
-      );
+      return const Center(child: CircularProgressIndicator());
     }
 
     if (_errorMessage != null) {
@@ -1228,16 +1473,9 @@ class _PartnerDashboardScreenState
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(
-                Icons.error_outline,
-                size: 50,
-                color: Colors.red,
-              ),
+              const Icon(Icons.error_outline, size: 50, color: Colors.red),
               const SizedBox(height: 16),
-              Text(
-                _errorMessage!,
-                textAlign: TextAlign.center,
-              ),
+              Text(_errorMessage!, textAlign: TextAlign.center),
               const SizedBox(height: 16),
               ElevatedButton(
                 onPressed: _loadAssignments,
@@ -1256,39 +1494,40 @@ class _PartnerDashboardScreenState
           physics: const AlwaysScrollableScrollPhysics(),
           children: [
             SizedBox(
-              height: MediaQuery.of(context).size.height * 0.65,
+              height: MediaQuery.of(context).size.height * 0.62,
               child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      _isOnline
-                          ? Icons.local_shipping_outlined
-                          : Icons.power_settings_new,
-                      size: 70,
-                      color: Colors.grey,
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      _isOnline
-                          ? 'No active assignments.'
-                          : 'You are offline.',
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      _isOnline
-                          ? 'Waiting for new shipments.'
-                          : 'Toggle ONLINE to receive pickups.',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 28),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        _isOnline
+                            ? Icons.local_shipping_outlined
+                            : Icons.power_settings_new,
+                        size: 70,
                         color: Colors.grey,
                       ),
-                    ),
-                  ],
+                      const SizedBox(height: 16),
+                      Text(
+                        _isOnline
+                            ? 'No active assignments'
+                            : 'You are currently offline',
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _isOnline
+                            ? 'Your live GPS is active. New shipments within 18 km will appear automatically.'
+                            : 'Toggle ONLINE in the top bar to receive and auto-claim pickups.',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.grey),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -1300,36 +1539,99 @@ class _PartnerDashboardScreenState
     return RefreshIndicator(
       onRefresh: _refreshAssignments,
       child: ListView.builder(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(16),
         physics: const AlwaysScrollableScrollPhysics(),
         itemCount: _assignments.length,
         itemBuilder: (context, index) {
-          final shipment = _assignments[index];
-
+          final shipment = Map<String, dynamic>.from(_assignments[index]);
           return _buildShipmentCard(shipment);
         },
       ),
     );
   }
 
-  // ==========================================================
-  // SHIPMENT CARD
-  // ==========================================================
+  String _nextStatusLabel(String status) {
+    switch (status) {
+      case 'Assigning Courier...':
+        return 'Accept Order';
+      case 'Order Confirmed':
+        return 'Going to Collect Package';
+      case 'Going to Collect Package':
+        return 'Mark Picked Up';
+      case 'Package Picked Up':
+        return 'Start Transit';
+      case 'In Transit':
+      case 'Processing at Facility':
+        return 'Out for Delivery';
+      case 'Out for Delivery':
+        return 'Complete (OTP)';
+      default:
+        return 'Out for Delivery';
+    }
+  }
 
-  Widget _buildShipmentCard(dynamic shipment) {
-    final trackingId = shipment['trackingId'] ?? 'N/A';
+  String _nextStatusValue(String status) {
+    switch (status) {
+      case 'Assigning Courier...':
+        return 'Order Confirmed';
+      case 'Order Confirmed':
+        return 'Going to Collect Package';
+      case 'Going to Collect Package':
+        return 'Package Picked Up';
+      case 'Package Picked Up':
+        return 'In Transit';
+      case 'In Transit':
+      case 'Processing at Facility':
+        return 'Out for Delivery';
+      case 'Out for Delivery':
+        return 'Delivered';
+      default:
+        return 'Out for Delivery';
+    }
+  }
 
-    final status = shipment['shipmentStatus'] ?? 'Unknown';
+  int _statusStepIndex(String status) {
+    switch (status) {
+      case 'Assigning Courier...':
+        return -1;
+      case 'Order Confirmed':
+        return 0;
+      case 'Going to Collect Package':
+        return 1;
+      case 'Package Picked Up':
+        return 2;
+      case 'Processing at Facility':
+      case 'In Transit':
+      case 'Out for Delivery':
+        return 3;
+      case 'Delivered':
+        return 4;
+      default:
+        return 0;
+    }
+  }
+
+  Widget _buildShipmentCard(Map<String, dynamic> shipment) {
+    final trackingId = shipment['trackingId']?.toString() ?? 'N/A';
+    final status = shipment['shipmentStatus']?.toString() ?? 'Order Confirmed';
+    final shipmentId = shipment['_id']?.toString() ?? '';
 
     final pickupAddress =
-        shipment['pickupLocation']?['formattedAddress'] ??
+        shipment['pickupLocation']?['formattedAddress']?.toString() ??
             'Pickup address unavailable';
-
     final deliveryAddress =
-        shipment['deliveryLocation']?['formattedAddress'] ??
+        shipment['deliveryLocation']?['formattedAddress']?.toString() ??
             'Delivery address unavailable';
 
-    final shipmentId = shipment['_id']?.toString() ?? '';
+    final sender = shipment['sender'] as Map<String, dynamic>? ?? {};
+    final receiver = shipment['receiver'] as Map<String, dynamic>? ?? {};
+    final pkg = shipment['packageDetails'] as Map<String, dynamic>? ?? {};
+    final paymentMethod = shipment['paymentMethod']?.toString() ?? 'online';
+    final shippingCost = shipment['shippingCost'] ?? 0;
+    final distanceKm = shipment['distanceKm'] ?? 0;
+    final unreadCount = _unreadChatCounts[shipmentId] ?? 0;
+    final currentStep = _statusStepIndex(status);
+    final isUploadingProof = _uploadingProofShipmentId == shipmentId;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
@@ -1348,142 +1650,646 @@ class _PartnerDashboardScreenState
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Tracking ID and status
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Expanded(
-                child: Text(
-                  'ID: $trackingId',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w700,
-                    fontSize: 16,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'ID: $trackingId',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                      ),
+                    ),
+                    Text(
+                      '${pkg['name'] ?? 'Parcel'} • ${pkg['weightKg'] ?? 1} kg • $distanceKm km',
+                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    ),
+                  ],
                 ),
               ),
-              Chip(
-                backgroundColor: const Color(0xFFF9EDE8),
-                label: Text(
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF9EDE8),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
                   status,
                   style: const TextStyle(
                     color: Color(0xFFF99A4F),
                     fontWeight: FontWeight.w600,
+                    fontSize: 11.5,
                   ),
                 ),
               ),
             ],
           ),
-
-          const SizedBox(height: 16),
-
-          // Pickup
+          const SizedBox(height: 12),
+          Row(
+            children: List.generate(4, (i) {
+              final active = i <= currentStep;
+              return Expanded(
+                flex: i == 3 ? 0 : 1,
+                child: Row(
+                  children: [
+                    Icon(
+                      active
+                          ? Icons.check_circle_rounded
+                          : Icons.radio_button_unchecked,
+                      size: 16,
+                      color: active ? const Color(0xFFF99A4F) : Colors.black26,
+                    ),
+                    if (i < 3)
+                      Expanded(
+                        child: Container(
+                          height: 2,
+                          margin: const EdgeInsets.symmetric(horizontal: 4),
+                          color: i < currentStep
+                              ? const Color(0xFFF99A4F)
+                              : Colors.black12,
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            }),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: paymentMethod == 'cod'
+                      ? const Color(0xFFFFF4E8)
+                      : const Color(0xFFEAF7F1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  paymentMethod == 'cod'
+                      ? 'Collect Cash (COD): ₹$shippingCost'
+                      : 'Prepaid Online • Earn ₹${((shippingCost as num) * 0.75).round()}',
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                    color: paymentMethod == 'cod'
+                        ? const Color(0xFFB86621)
+                        : const Color(0xFF1F7A50),
+                  ),
+                ),
+              ),
+              if (pkg['isFragile'] == true) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.red.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Text(
+                    'FRAGILE',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.red,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 14),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(
-                Icons.circle,
-                size: 12,
-                color: Colors.green,
+              const Padding(
+                padding: EdgeInsets.only(top: 4),
+                child: Icon(Icons.circle, size: 11, color: Color(0xFF42B883)),
               ),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Pickup',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                      ),
+                    Text(
+                      'Pickup • ${sender['name'] ?? 'Sender'}',
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
                     ),
                     Text(
                       pickupAddress,
-                      style: const TextStyle(
-                        color: Colors.grey,
-                      ),
+                      style: const TextStyle(color: Colors.grey, fontSize: 12.5),
                     ),
+                    if ((sender['phone'] ?? '').toString().isNotEmpty)
+                      GestureDetector(
+                        onTap: () {
+                          Clipboard.setData(
+                            ClipboardData(text: sender['phone'].toString()),
+                          );
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Copied sender phone: ${sender['phone']}'),
+                            ),
+                          );
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Text(
+                            '📞 ${sender['phone']} (tap to copy)',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              color: Color(0xFFF99A4F),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
                   ],
                 ),
               ),
             ],
           ),
-
-          const SizedBox(height: 14),
-
-          // Delivery
+          const SizedBox(height: 12),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(
-                Icons.location_on,
-                size: 16,
-                color: Colors.red,
+              const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: Icon(Icons.location_on, size: 15, color: Colors.red),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Delivery',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                      ),
+                    Text(
+                      'Drop-off • ${receiver['name'] ?? 'Receiver'}',
+                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
                     ),
                     Text(
                       deliveryAddress,
-                      style: const TextStyle(
-                        color: Colors.grey,
-                      ),
+                      style: const TextStyle(color: Colors.grey, fontSize: 12.5),
                     ),
+                    if ((receiver['phone'] ?? '').toString().isNotEmpty)
+                      GestureDetector(
+                        onTap: () {
+                          Clipboard.setData(
+                            ClipboardData(text: receiver['phone'].toString()),
+                          );
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Copied receiver phone: ${receiver['phone']}'),
+                            ),
+                          );
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 2),
+                          child: Text(
+                            '📞 ${receiver['phone']} (tap to copy)',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              color: Color(0xFFF99A4F),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
                   ],
                 ),
               ),
             ],
           ),
-
-          const SizedBox(height: 18),
-
-          // Actions
+          const SizedBox(height: 16),
           Row(
             children: [
               Expanded(
-                child: OutlinedButton(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
                   onPressed: shipmentId.isEmpty
                       ? null
-                      : () => _advanceStatus(
-                            shipmentId,
-                            'Out for Delivery',
-                          ),
-                  child: const Text(
-                    'Out for Delivery',
-                    textAlign: TextAlign.center,
+                      : () => _openChatScreen(shipment),
+                  icon: Badge(
+                    isLabelVisible: unreadCount > 0,
+                    label: Text('$unreadCount'),
+                    child: const Icon(Icons.chat_bubble_outline_rounded, size: 17),
                   ),
+                  label: const Text('Chat', style: TextStyle(fontSize: 12.5)),
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 8),
               Expanded(
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFF99A4F),
-                    foregroundColor: Colors.white,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
                   ),
-                  onPressed: shipmentId.isEmpty
+                  onPressed: () {
+                    setState(() {
+                      _mapFocusedShipmentId = shipmentId;
+                      _navIndex = 1;
+                    });
+                  },
+                  icon: const Icon(Icons.map_outlined, size: 17),
+                  label: const Text('Route', style: TextStyle(fontSize: 12.5)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed: (shipmentId.isEmpty || isUploadingProof)
                       ? null
-                      : () => _advanceStatus(
+                      : () => _uploadProofPhoto(
                             shipmentId,
-                            'Delivered',
+                            currentStep < 2 ? 'pickup' : 'delivery',
                           ),
-                  child: const Text(
-                    'Complete (OTP)',
-                    textAlign: TextAlign.center,
-                  ),
+                  icon: isUploadingProof
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.camera_alt_outlined, size: 17),
+                  label: const Text('Proof', style: TextStyle(fontSize: 12.5)),
                 ),
               ),
             ],
           ),
+          const SizedBox(height: 10),
+          if (status == 'Assigning Courier...') ...[
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF4E8),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: const Color(0xFFF99A4F).withValues(alpha: 0.45),
+                ),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.notifications_active_rounded,
+                      size: 16, color: Color(0xFFF99A4F)),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'New delivery request — accept to lock this order or decline to reassign.',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF9A5218),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 46,
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.red.shade700,
+                        side: BorderSide(color: Colors.red.shade300),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      onPressed: shipmentId.isEmpty
+                          ? null
+                          : () => _respondToOffer(shipmentId, accept: false),
+                      child: const Text(
+                        'Decline',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: SizedBox(
+                    height: 46,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF42B883),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      onPressed: shipmentId.isEmpty
+                          ? null
+                          : () => _respondToOffer(shipmentId, accept: true),
+                      icon: const Icon(Icons.check_circle_outline_rounded,
+                          size: 18),
+                      label: const Text(
+                        'Accept Order',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 14.5,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ] else
+            SizedBox(
+              width: double.infinity,
+              height: 46,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFF99A4F),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                onPressed: shipmentId.isEmpty
+                    ? null
+                    : () =>
+                        _advanceStatus(shipmentId, _nextStatusValue(status)),
+                child: Text(
+                  _nextStatusLabel(status),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 14.5,
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
+    );
+  }
+
+  Widget _buildProfileAndEarningsTab() {
+    final name = _agentProfile?['name']?.toString() ?? 'Delivery Partner';
+    final email = _agentProfile?['email']?.toString() ?? '';
+    final phone = _agentProfile?['phone']?.toString() ?? '';
+    final vehicleType =
+        (_agentProfile?['vehicleType']?.toString() ?? 'bike').toUpperCase();
+    final vehicleNumber = _agentProfile?['vehicleNumber']?.toString() ?? 'N/A';
+    final licenseNumber = _agentProfile?['licenseNumber']?.toString() ?? 'N/A';
+    final totalDeliveries = _agentProfile?['totalDeliveries'] ?? 0;
+    final totalEarnings = _agentProfile?['totalEarnings'] ?? 0;
+    final rating = _agentProfile?['rating'] ?? 5.0;
+
+    return RefreshIndicator(
+      onRefresh: _loadAgentProfile,
+      child: ListView(
+        padding: const EdgeInsets.all(20),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1D24),
+              borderRadius: BorderRadius.circular(24),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 28,
+                      backgroundColor: const Color(0xFFF99A4F),
+                      child: Text(
+                        name.isNotEmpty ? name[0].toUpperCase() : 'P',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 22,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            name,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 18,
+                            ),
+                          ),
+                          if (email.isNotEmpty)
+                            Text(
+                              email,
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12.5,
+                              ),
+                            ),
+                          if (phone.isNotEmpty)
+                            Text(
+                              phone,
+                              style: const TextStyle(
+                                color: Colors.white60,
+                                fontSize: 12,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _StatPill(
+                        label: 'Earnings',
+                        value: '₹$totalEarnings',
+                        accent: const Color(0xFF42B883),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _StatPill(
+                        label: 'Deliveries',
+                        value: '$totalDeliveries',
+                        accent: const Color(0xFFF99A4F),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _StatPill(
+                        label: 'Rating',
+                        value: '$rating ★',
+                        accent: Colors.amber,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Vehicle & Compliance',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+                ),
+                const SizedBox(height: 12),
+                _DetailRow(label: 'Vehicle Type', value: vehicleType),
+                const Divider(height: 20),
+                _DetailRow(label: 'Registration No.', value: vehicleNumber),
+                const Divider(height: 20),
+                _DetailRow(label: 'License Number', value: licenseNumber),
+                const Divider(height: 20),
+                _DetailRow(
+                  label: 'Live GPS Status',
+                  value: _currentPosition != null
+                      ? '${_currentPosition!.latitude.toStringAsFixed(4)}, ${_currentPosition!.longitude.toStringAsFixed(4)}'
+                      : 'Not acquired',
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            height: 48,
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: () => _broadcastLocationNow(showToast: true),
+              icon: const Icon(Icons.my_location_rounded, color: Color(0xFFF99A4F)),
+              label: const Text('Sync Current GPS Location Now'),
+            ),
+          ),
+          if (widget.onLogout != null) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 48,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.shade600,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                onPressed: () async {
+                  _stopHeartbeatTimer();
+                  try {
+                    await _dio.put('/agents/availability', data: {'isOnline': false});
+                  } catch (_) {}
+                  await _stopLocationTracking();
+                  _disconnectSocket();
+                  await widget.onLogout!();
+                },
+                icon: const Icon(Icons.logout_rounded),
+                label: const Text(
+                  'Go Offline & Logout',
+                  style: TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _StatPill extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color accent;
+
+  const _StatPill({
+    required this.label,
+    required this.value,
+    required this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF282C37),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        children: [
+          Text(
+            value,
+            style: TextStyle(
+              color: accent,
+              fontWeight: FontWeight.w700,
+              fontSize: 16,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DetailRow extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _DetailRow({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        Text(
+          value,
+          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5),
+        ),
+      ],
     );
   }
 }

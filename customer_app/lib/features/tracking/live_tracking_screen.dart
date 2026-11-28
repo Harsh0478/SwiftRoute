@@ -530,6 +530,7 @@ class _LiveTrackingScreenState extends ConsumerState<LiveTrackingScreen> {
                                       _status == 'Out for Delivery')
                                   ? 2
                                   : (_status == 'Order Confirmed' ||
+                                          _status == 'Going to Collect Package' ||
                                           _status == 'Package Picked Up')
                                       ? 1
                                       : 0;

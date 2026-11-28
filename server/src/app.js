@@ -73,6 +73,8 @@ app.post('/api/agents/login', agentController.loginAgent);
 app.get('/api/agents/profile', protect, authorizeRoles('agent'), (req, res) => res.json({ success: true, agent: req.user.doc }));
 app.put('/api/agents/availability', protect, authorizeRoles('agent'), agentController.toggleAvailability);
 app.get('/api/agents/assignments', protect, authorizeRoles('agent'), agentController.getAssignments);
+app.put('/api/agents/shipments/:id/accept', protect, authorizeRoles('agent'), agentController.acceptShipment);
+app.put('/api/agents/shipments/:id/decline', protect, authorizeRoles('agent'), agentController.declineShipment);
 app.put('/api/agents/shipments/:id/status', protect, authorizeRoles('agent'), agentController.updateShipmentStatus);
 app.post('/api/agents/shipments/:id/proof', protect, authorizeRoles('agent'), upload.single('proofImage'), agentController.uploadProof);
 

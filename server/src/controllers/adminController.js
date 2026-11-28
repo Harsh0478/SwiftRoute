@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const DeliveryAgent = require('../models/DeliveryAgent');
 const Shipment = require('../models/Shipment');
+const { ACTIVE_STATUSES, offerShipmentToAgent } = require('../services/dispatchService');
 
 exports.getDashboardStats = async (req, res, next) => {
   try {
@@ -38,15 +39,27 @@ exports.getDashboardStats = async (req, res, next) => {
 exports.assignAgent = async (req, res, next) => {
   try {
     const { agentId } = req.body;
-    const shipment = await Shipment.findByIdAndUpdate(
-      req.params.id,
-      { deliveryAgentId: agentId, shipmentStatus: 'Order Confirmed' },
-      { new: true }
-    ).populate('deliveryAgentId', 'name phone avatarUrl vehicleNumber');
+    const activeCount = await Shipment.countDocuments({
+      deliveryAgentId: agentId,
+      shipmentStatus: { $in: ACTIVE_STATUSES },
+    });
+    if (activeCount > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected partner already has an active order in progress.',
+      });
+    }
 
-    req.app.get('io')?.to(`user:${agentId}`).emit('agent:new_assignment', shipment);
-    req.app.get('io')?.to(`shipment:${shipment._id}`).emit('shipment:status_updated', shipment);
-    res.json({ success: true, shipment });
+    const [shipment, agent] = await Promise.all([
+      Shipment.findById(req.params.id),
+      DeliveryAgent.findById(agentId),
+    ]);
+    if (!shipment || !agent) {
+      return res.status(404).json({ success: false, message: 'Shipment or partner not found' });
+    }
+
+    const offered = await offerShipmentToAgent(req.app.get('io'), shipment, agent, req.user.id);
+    res.json({ success: true, shipment: offered });
   } catch (err) {
     next(err);
   }

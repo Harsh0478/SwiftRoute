@@ -1,23 +1,15 @@
 const Shipment = require('../models/Shipment');
 const Promotion = require('../models/Promotion');
-const DeliveryAgent = require('../models/DeliveryAgent');
 const { generateTrackingId, generateDeliveryOtp } = require('../utils/generateTrackingId');
 const calculateDeliveryPrice = require('../utils/calculateDeliveryPrice');
 const { uploadBufferToCloudinary } = require('../config/cloudinary');
-const { sendPushNotification } = require('../services/notificationService');
-
-const NEARBY_COURIER_RADIUS_KM = 18;
-
-function haversineKm(lat1, lng1, lat2, lng2) {
-  const toRad = (deg) => (deg * Math.PI) / 180;
-  const R = 6371;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
+const {
+  NEARBY_COURIER_RADIUS_KM,
+  syncAgentAvailability,
+  findNearbyAvailableAgents,
+  findNextAvailableAgent,
+  offerShipmentToAgent,
+} = require('../services/dispatchService');
 
 function calculateEstimatedDurationMinutes(distanceKm, deliveryType) {
   const safeDistance = Math.max(Number(distanceKm) || 2, 2);
@@ -34,53 +26,6 @@ function calculateEstimatedDurationMinutes(distanceKm, deliveryType) {
   return Math.max(150, Math.round((safeDistance / speed) * 60 + buffer));
 }
 
-async function findNearbyAgents(pickupCoords, radiusKm = NEARBY_COURIER_RADIUS_KM) {
-  const [pickupLng, pickupLat] = pickupCoords;
-  const maxMeters = radiusKm * 1000;
-
-  try {
-    const activeThreshold = new Date(Date.now() - 3 * 60 * 1000);
-    const agents = await DeliveryAgent.find({
-      isOnline: true,
-      isAvailable: true,
-      kycStatus: 'approved',
-      lastSeenAt: { $gte: activeThreshold },
-      currentLocation: {
-        $near: {
-          $geometry: { type: 'Point', coordinates: [Number(pickupLng), Number(pickupLat)] },
-          $maxDistance: maxMeters,
-        },
-      },
-    }).limit(10);
-
-    return agents.map((agent) => {
-      const [aLng, aLat] = agent.currentLocation?.coordinates || [0, 0];
-      return {
-        agent,
-        distanceKm: Number(haversineKm(Number(pickupLat), Number(pickupLng), aLat, aLng).toFixed(2)),
-      };
-    });
-  } catch (_) {
-    // Fallback Haversine filter if 2dsphere index is still building
-    const onlineAgents = await DeliveryAgent.find({
-      isOnline: true,
-      isAvailable: true,
-      kycStatus: 'approved',
-      lastSeenAt: { $gte: activeThreshold },
-    });
-
-    return onlineAgents
-      .map((agent) => {
-        const [aLng, aLat] = agent.currentLocation?.coordinates || [0, 0];
-        if (aLat === 0 && aLng === 0) return null;
-        const dist = haversineKm(Number(pickupLat), Number(pickupLng), aLat, aLng);
-        return dist <= radiusKm ? { agent, distanceKm: Number(dist.toFixed(2)) } : null;
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.distanceKm - b.distanceKm);
-  }
-}
-
 exports.checkNearbyAgents = async (req, res, next) => {
   try {
     const lat = Number(req.query.lat);
@@ -92,7 +37,7 @@ exports.checkNearbyAgents = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Valid lat and lng query parameters are required.' });
     }
 
-    const nearby = await findNearbyAgents([lng, lat], radiusKm);
+    const nearby = await findNearbyAvailableAgents([lng, lat], { radiusKm });
     const nearest = nearby[0] || null;
 
     res.json({
@@ -147,27 +92,19 @@ exports.createShipment = async (req, res, next) => {
       });
     }
 
-    // 1. Search for nearest online & available partner within 18 km (15-20 km radius)
-    const nearby = await findNearbyAgents(pickupLocation.coordinates, NEARBY_COURIER_RADIUS_KM);
-    let nearestAgent = nearby[0]?.agent || null;
+    // Find nearest free online partner (excludes any partner who already has an active order)
+    const nearestAgent = await findNextAvailableAgent(pickupLocation.coordinates, {
+      radiusKm: NEARBY_COURIER_RADIUS_KM,
+      allowDevFallback: isDevMode,
+    });
 
     if (!isDevMode && !nearestAgent) {
       return res.status(400).json({
         success: false,
         code: 'NO_COURIER_NEARBY',
         message:
-          'No delivery partner available within 18 km of pickup location. Enable Development Mode in Profile to send directly.',
+          'No free delivery partner available within 18 km of pickup location. Enable Development Mode in Profile to send directly.',
       });
-    }
-
-    // 2. In Development Mode, fall back to any online & available partner so testing auto-assigns
-    if (isDevMode && !nearestAgent) {
-      nearestAgent = await DeliveryAgent.findOne({
-        isOnline: true,
-        isAvailable: true,
-        kycStatus: 'approved',
-        lastSeenAt: { $gte: new Date(Date.now() - 3 * 60 * 1000) },
-      }).sort({ lastSeenAt: -1 });
     }
 
     let imageUrl = packageDetails.imageUrl || '';
@@ -196,12 +133,10 @@ exports.createShipment = async (req, res, next) => {
     const calculatedMinutes = calculateEstimatedDurationMinutes(distanceKm, deliveryType);
     const estimatedDelivery = new Date(Date.now() + calculatedMinutes * 60 * 1000);
 
-    const initialStatus = nearestAgent ? 'Order Confirmed' : 'Assigning Courier...';
-
     const shipment = await Shipment.create({
       trackingId: generateTrackingId(),
       customerId: req.user.id,
-      deliveryAgentId: nearestAgent ? nearestAgent._id : null,
+      deliveryAgentId: null,
       sender,
       receiver,
       packageDetails: { ...packageDetails, imageUrl },
@@ -215,35 +150,31 @@ exports.createShipment = async (req, res, next) => {
       shippingCost: pricing.totalAmount,
       paymentMethod,
       paymentStatus: 'pending',
-      shipmentStatus: initialStatus,
+      shipmentStatus: 'Assigning Courier...',
       estimatedDelivery,
       currentLocation: { type: 'Point', coordinates: pickupLocation.coordinates },
       deliveryOtp: generateDeliveryOtp(),
       trackingHistory: [
         {
-          status: initialStatus,
-          title: initialStatus,
-          description: nearestAgent
-            ? `Assigned to courier partner ${nearestAgent.name}.`
-            : 'Searching for an available delivery partner near pickup.',
+          status: 'Assigning Courier...',
+          title: 'Order Placed',
+          description: 'Searching for a free delivery partner near pickup.',
           updatedBy: req.user.id,
         },
       ],
     });
 
+    let responseShipment = shipment;
     if (nearestAgent) {
-      req.app.get('io')?.to(`user:${nearestAgent._id}`).emit('agent:new_assignment', shipment);
-      await sendPushNotification({
-        recipient: nearestAgent,
-        recipientModel: 'DeliveryAgent',
-        title: 'New Pickup Assigned',
-        body: `Package #${shipment.trackingId} is ready for pickup in ${pickupLocation.city}.`,
-        type: 'pickup',
-        shipmentId: shipment._id,
-      });
+      responseShipment = await offerShipmentToAgent(
+        req.app.get('io'),
+        shipment,
+        nearestAgent,
+        req.user.id
+      );
     }
 
-    res.status(201).json({ success: true, shipment });
+    res.status(201).json({ success: true, shipment: responseShipment });
   } catch (err) {
     next(err);
   }
@@ -260,6 +191,7 @@ exports.getCustomerShipments = async (req, res, next) => {
           $in: [
             'Assigning Courier...',
             'Order Confirmed',
+            'Going to Collect Package',
             'Package Picked Up',
             'Processing at Facility',
             'In Transit',
@@ -320,10 +252,18 @@ exports.cancelShipment = async (req, res, next) => {
     const shipment = await Shipment.findOne({ _id: req.params.id, customerId: req.user.id });
     if (!shipment) return res.status(404).json({ success: false, message: 'Shipment not found' });
 
-    if (!['Assigning Courier...', 'Order Confirmed', 'Package Picked Up'].includes(shipment.shipmentStatus)) {
+    if (
+      ![
+        'Assigning Courier...',
+        'Order Confirmed',
+        'Going to Collect Package',
+        'Package Picked Up',
+      ].includes(shipment.shipmentStatus)
+    ) {
       return res.status(400).json({ success: false, message: 'Shipment in transit cannot be cancelled' });
     }
 
+    const previousAgentId = shipment.deliveryAgentId;
     shipment.shipmentStatus = 'Cancelled';
     shipment.cancellationReason = req.body.reason || 'Cancelled by customer';
     shipment.trackingHistory.push({
@@ -333,6 +273,10 @@ exports.cancelShipment = async (req, res, next) => {
       updatedBy: req.user.id,
     });
     await shipment.save();
+
+    if (previousAgentId) {
+      await syncAgentAvailability(previousAgentId);
+    }
 
     req.app.get('io')?.to(`shipment:${shipment._id}`).emit('shipment:status_updated', shipment);
     res.json({ success: true, shipment });

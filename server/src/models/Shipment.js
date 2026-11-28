@@ -18,6 +18,7 @@ const trackingEventSchema = new mongoose.Schema(
       enum: [
         'Assigning Courier...',
         'Order Confirmed',
+        'Going to Collect Package',
         'Package Picked Up',
         'Processing at Facility',
         'In Transit',
@@ -40,6 +41,7 @@ const shipmentSchema = new mongoose.Schema(
     trackingId: { type: String, required: true, unique: true, uppercase: true, index: true },
     customerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     deliveryAgentId: { type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryAgent', default: null, index: true },
+    declinedAgentIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'DeliveryAgent' }],
     sender: {
       name: { type: String, required: true },
       phone: { type: String, required: true },
@@ -93,6 +95,7 @@ const shipmentSchema = new mongoose.Schema(
       enum: [
         'Assigning Courier...',
         'Order Confirmed',
+        'Going to Collect Package',
         'Package Picked Up',
         'Processing at Facility',
         'In Transit',
@@ -119,6 +122,7 @@ const shipmentSchema = new mongoose.Schema(
 
 shipmentSchema.index({ pickupLocation: '2dsphere' });
 shipmentSchema.index({ deliveryLocation: '2dsphere' });
-shipmentSchema.index({ currentLocation: '2dsphere' });
+shipmentSchema.index({ customerId: 1, createdAt: -1 });
+shipmentSchema.index({ deliveryAgentId: 1, shipmentStatus: 1 });
 
 module.exports = mongoose.model('Shipment', shipmentSchema);
