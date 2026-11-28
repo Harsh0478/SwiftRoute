@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
 import '../../core/network/dio_client.dart';
+import '../../core/services/fast_location_service.dart';
 import '../../core/services/mapbox_geocoding_service.dart';
 import '../../core/theme/app_theme.dart';
 
@@ -52,12 +53,32 @@ class _HomeDashboardScreenState extends ConsumerState<HomeDashboardScreen> {
         return;
       }
 
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 10),
-        ),
+      // 1. Show cached/last-known location immediately (<50ms)
+      final instantPos = await FastLocationService.getInstantPosition();
+      if (instantPos != null && mounted) {
+        final quickPlace = await ref.read(mapboxGeocodingProvider).reverseGeocode(
+              latitude: instantPos.latitude,
+              longitude: instantPos.longitude,
+            );
+        if (mounted) {
+          setState(() {
+            _currentAddress = quickPlace?.fullAddress ??
+                '${instantPos.latitude.toStringAsFixed(4)}, ${instantPos.longitude.toStringAsFixed(4)}';
+            _locating = false;
+          });
+        }
+      }
+
+      // 2. Refine with fast Wi-Fi/GPS fix (4s timeout instead of 10s cold GPS hang)
+      final pos = await FastLocationService.getFastPosition(
+        timeout: const Duration(seconds: 4),
       );
+      if (pos == null) {
+        if (instantPos == null && mounted) {
+          setState(() => _currentAddress = 'Tap to retry location');
+        }
+        return;
+      }
 
       final place = await ref.read(mapboxGeocodingProvider).reverseGeocode(
             latitude: pos.latitude,

@@ -11,6 +11,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
+import 'core/services/fast_location_service.dart';
 import 'features/chat/partner_chat_screen.dart';
 import 'features/map/partner_route_map_screen.dart';
 
@@ -537,11 +538,13 @@ class _PartnerDashboardScreenState
     final hasPermission = await _checkLocationPermission(silent: true);
     if (!hasPermission) return;
 
-    final pos = await _acquireCurrentPosition();
-    if (pos == null || !mounted) return;
+    // 1. Use instant cached/last-known GPS fix (<50ms) so going online never stalls
+    final instantPos = await FastLocationService.getInstantPosition();
+    final initialPos = instantPos ?? await _acquireCurrentPosition();
+    if (initialPos == null || !mounted) return;
 
     setState(() {
-      _currentPosition = pos;
+      _currentPosition = initialPos;
       _lastLocationSyncedAt = DateTime.now();
     });
 
@@ -554,8 +557,8 @@ class _PartnerDashboardScreenState
         '/agents/availability',
         data: {
           'isOnline': true,
-          'lat': pos.latitude,
-          'lng': pos.longitude,
+          'lat': initialPos.latitude,
+          'lng': initialPos.longitude,
         },
       );
 
@@ -573,22 +576,31 @@ class _PartnerDashboardScreenState
       if (!serverOnline) {
         await _loadAssignments();
       }
+
+      // 2. Refine with a fresh fast GPS fix in the background if we used cached coordinates
+      if (instantPos != null) {
+        unawaited(() async {
+          final freshPos = await FastLocationService.getFastPosition(
+            timeout: const Duration(seconds: 4),
+          );
+          if (freshPos != null && mounted && _isOnline) {
+            setState(() {
+              _currentPosition = freshPos;
+              _lastLocationSyncedAt = DateTime.now();
+            });
+            await _sendLocation(freshPos);
+          }
+        }());
+      }
     } catch (e) {
       debugPrint('Initial location sync warning: $e');
     }
   }
 
   Future<geo.Position?> _acquireCurrentPosition() async {
-    try {
-      return await geo.Geolocator.getCurrentPosition(
-        locationSettings: const geo.LocationSettings(
-          accuracy: geo.LocationAccuracy.high,
-          timeLimit: Duration(seconds: 8),
-        ),
-      );
-    } catch (_) {
-      return await geo.Geolocator.getLastKnownPosition();
-    }
+    return await FastLocationService.getFastPosition(
+      timeout: const Duration(seconds: 4),
+    );
   }
 
   Future<void> _loadAssignments() async {
@@ -736,10 +748,41 @@ class _PartnerDashboardScreenState
     setState(() => _isUpdatingAvailability = true);
 
     try {
+      // Going offline should never block on waiting for a new GPS lock
+      if (!value) {
+        final knownPos =
+            _currentPosition ?? await FastLocationService.getInstantPosition();
+        await _dio.put(
+          '/agents/availability',
+          data: {
+            'isOnline': false,
+            if (knownPos != null) 'lat': knownPos.latitude,
+            if (knownPos != null) 'lng': knownPos.longitude,
+          },
+        );
+
+        _stopHeartbeatTimer();
+        await _stopLocationTracking();
+        _disconnectSocket();
+
+        if (!mounted) return;
+        setState(() {
+          _isOnline = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('You are now offline.')),
+        );
+        return;
+      }
+
       final hasPermission = await _checkLocationPermission();
       if (!hasPermission) return;
 
-      final geo.Position? position = await _acquireCurrentPosition();
+      // 1. Use instant cached/last-known position (<50ms) or fast 4s GPS lock
+      final instantPos =
+          _currentPosition ?? await FastLocationService.getInstantPosition();
+      final geo.Position? position = instantPos ?? await _acquireCurrentPosition();
       if (position == null) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
@@ -753,44 +796,52 @@ class _PartnerDashboardScreenState
       final res = await _dio.put(
         '/agents/availability',
         data: {
-          'isOnline': value,
+          'isOnline': true,
           'lat': position.latitude,
           'lng': position.longitude,
         },
       );
 
-      if (value) {
-        await _connectSocket();
-        _joinAllAssignmentRooms();
-        _startLocationTracking();
-        _startHeartbeatTimer();
-        await _loadAssignments();
-      } else {
-        _stopHeartbeatTimer();
-        await _stopLocationTracking();
-        _disconnectSocket();
-      }
+      await _connectSocket();
+      _joinAllAssignmentRooms();
+      _startLocationTracking();
+      _startHeartbeatTimer();
+      await _loadAssignments();
 
       if (!mounted) return;
 
       setState(() {
         _currentPosition = position;
         _lastLocationSyncedAt = DateTime.now();
-        _isOnline = value;
+        _isOnline = true;
       });
 
       final claimed = res.data?['claimedCount'] ?? 0;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            value
-                ? (claimed > 0
-                    ? 'You are online! $claimed pending order(s) assigned.'
-                    : 'You are now online and sharing live GPS.')
-                : 'You are now offline.',
+            claimed > 0
+                ? 'You are online! $claimed pending order(s) assigned.'
+                : 'You are now online and sharing live GPS.',
           ),
         ),
       );
+
+      // 2. Refine with a fresh GPS fix in the background without blocking toggle
+      if (instantPos != null) {
+        unawaited(() async {
+          final freshPos = await FastLocationService.getFastPosition(
+            timeout: const Duration(seconds: 4),
+          );
+          if (freshPos != null && mounted && _isOnline) {
+            setState(() {
+              _currentPosition = freshPos;
+              _lastLocationSyncedAt = DateTime.now();
+            });
+            await _sendLocation(freshPos);
+          }
+        }());
+      }
     } on DioException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -820,8 +871,23 @@ class _PartnerDashboardScreenState
       final hasPermission = await _checkLocationPermission();
       if (!hasPermission) return;
 
-      final pos = await _acquireCurrentPosition();
-      if (pos == null) {
+      // 1. Sync instant cached/last-known position immediately (<50ms)
+      final instantPos = await FastLocationService.getInstantPosition();
+      if (instantPos != null && mounted) {
+        setState(() {
+          _currentPosition = instantPos;
+          _lastLocationSyncedAt = DateTime.now();
+        });
+        unawaited(_sendLocation(instantPos));
+      }
+
+      // 2. Fetch fresh Wi-Fi/GPS fix with a 4-second timeout
+      final freshPos = await FastLocationService.getFastPosition(
+        timeout: const Duration(seconds: 4),
+      );
+      final finalPos = freshPos ?? instantPos;
+
+      if (finalPos == null) {
         if (mounted && showToast) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Could not get current GPS coordinates.')),
@@ -830,10 +896,10 @@ class _PartnerDashboardScreenState
         return;
       }
 
-      await _sendLocation(pos);
+      await _sendLocation(finalPos);
       if (!mounted) return;
       setState(() {
-        _currentPosition = pos;
+        _currentPosition = finalPos;
         _lastLocationSyncedAt = DateTime.now();
       });
 
@@ -841,7 +907,7 @@ class _PartnerDashboardScreenState
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Location updated: ${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}',
+              'Location updated: ${finalPos.latitude.toStringAsFixed(4)}, ${finalPos.longitude.toStringAsFixed(4)}',
             ),
             duration: const Duration(seconds: 2),
           ),
@@ -941,6 +1007,7 @@ class _PartnerDashboardScreenState
       ),
     ).listen(
       (geo.Position position) {
+        FastLocationService.remember(position);
         if (mounted) {
           setState(() {
             _currentPosition = position;

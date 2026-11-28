@@ -8,6 +8,7 @@ import 'package:mapbox_maps_flutter/mapbox_maps_flutter.dart' as mapbox;
 import 'package:razorpay_flutter/razorpay_flutter.dart';
 import '../../core/network/dio_client.dart';
 import '../../core/providers/dev_mode_provider.dart';
+import '../../core/services/fast_location_service.dart';
 import '../../core/services/mapbox_geocoding_service.dart';
 import '../../core/theme/app_theme.dart';
 
@@ -187,33 +188,63 @@ class _PackageBookingWizardState extends ConsumerState<PackageBookingWizard> {
         return;
       }
 
-      final pos = await geo.Geolocator.getCurrentPosition(
-        locationSettings:
-            const geo.LocationSettings(accuracy: geo.LocationAccuracy.high),
-      );
-      final place = await ref.read(mapboxGeocodingProvider).reverseGeocode(
-            latitude: pos.latitude,
-            longitude: pos.longitude,
+      final serviceEnabled = await geo.Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Please turn on device Location / GPS first.'),
+              backgroundColor: AppColors.error,
+            ),
           );
-
-      if (!mounted) {
+        }
         return;
       }
-      setState(() {
-        _pickupLat = pos.latitude;
-        _pickupLng = pos.longitude;
-        _nearbyAgentsCount = null;
-        if (place != null) {
-          _pickupAddr.text = place.fullAddress;
-          _pickupCity.text = place.city;
-          _pickupPin.text = place.postalCode;
-          _pickupSearchCtrl.text = place.name;
-        } else {
-          _pickupAddr.text =
-              '${pos.latitude.toStringAsFixed(5)}, ${pos.longitude.toStringAsFixed(5)}';
-        }
-        _pickupSuggestions = [];
-      });
+
+      Future<void> applyPosition(geo.Position pos) async {
+        final place = await ref.read(mapboxGeocodingProvider).reverseGeocode(
+              latitude: pos.latitude,
+              longitude: pos.longitude,
+            );
+        if (!mounted) return;
+        setState(() {
+          _pickupLat = pos.latitude;
+          _pickupLng = pos.longitude;
+          _nearbyAgentsCount = null;
+          if (place != null) {
+            _pickupAddr.text = place.fullAddress;
+            _pickupCity.text = place.city;
+            _pickupPin.text = place.postalCode;
+            _pickupSearchCtrl.text = place.name;
+          } else {
+            _pickupAddr.text =
+                '${pos.latitude.toStringAsFixed(5)}, ${pos.longitude.toStringAsFixed(5)}';
+          }
+          _pickupSuggestions = [];
+        });
+      }
+
+      // 1. Fill immediately from cached/last-known position if available
+      final instantPos = await FastLocationService.getInstantPosition();
+      if (instantPos != null) {
+        await applyPosition(instantPos);
+        if (mounted) setState(() => _locatingPickup = false);
+      }
+
+      // 2. Fetch fresh Wi-Fi/GPS position with a 4-second timeout (never hangs)
+      final freshPos = await FastLocationService.getFastPosition(
+        timeout: const Duration(seconds: 4),
+      );
+      if (freshPos != null) {
+        await applyPosition(freshPos);
+      } else if (instantPos == null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not lock GPS signal. Try Pin on Map or search address.'),
+            backgroundColor: AppColors.error,
+          ),
+        );
+      }
     } finally {
       if (mounted) {
         setState(() => _locatingPickup = false);
